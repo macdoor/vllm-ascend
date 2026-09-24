@@ -668,6 +668,24 @@ npu_copy_and_expand_eagle_inputs_meta(
             out_new_token_indices, out_hidden_state_mapping};
 }
 
+at::Tensor npu_causal_conv1d_custom_meta(
+    const at::Tensor& output,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& bias_opt,
+    const c10::optional<at::Tensor>& query_start_loc_opt,
+    const c10::optional<at::Tensor>& cache_indices_opt,
+    const c10::optional<at::Tensor>& initial_state_mode_opt,
+    const c10::optional<at::Tensor>& num_accepted_tokens_opt,
+    int64_t  activation_mode,
+    int64_t  pad_slot_id,
+    int64_t  run_mode,
+    int64_t  max_query_len)
+{
+    return output;
+}
+
 at::Tensor npu_causal_conv1d_310_meta(
     const at::Tensor& x,
     const at::Tensor& weight,

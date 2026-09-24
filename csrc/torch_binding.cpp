@@ -703,6 +703,53 @@ npu_copy_and_expand_eagle_inputs(
             out_new_token_indices, out_hidden_state_mapping};
 }
 
+at::Tensor npu_causal_conv1d_custom(
+    const at::Tensor& output,
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& conv_state,
+    const c10::optional<at::Tensor>& bias_opt,
+    const c10::optional<at::Tensor>& query_start_loc_opt,
+    const c10::optional<at::Tensor>& cache_indices_opt,
+    const c10::optional<at::Tensor>& initial_state_mode_opt,
+    const c10::optional<at::Tensor>& num_accepted_tokens_opt,
+    int64_t  activation_mode,
+    int64_t  pad_slot_id,
+    int64_t  run_mode,
+    int64_t  max_query_len)
+{
+    if (max_query_len >= 0) {
+        // CausalConv1dV2 fast path (ported from PR #16468, A5 Kimi K3 stack):
+        // dim-last layout, host-metadata friendly, spec-decode aware.
+        const c10::optional<at::IntArrayRef> no_cpu_metadata = c10::nullopt;
+        const char* activation = activation_mode == 1 ? "silu" : "none";
+        const int64_t null_block_id = -1;
+        const int64_t head_num = 0;
+        const int64_t update_bound = run_mode == 1 ? max_query_len : -1;
+        EXEC_NPU_CMD(aclnnCausalConv1dV2, x, weight, bias_opt, conv_state,
+            query_start_loc_opt, cache_indices_opt, initial_state_mode_opt, num_accepted_tokens_opt,
+            no_cpu_metadata, no_cpu_metadata, no_cpu_metadata, no_cpu_metadata,
+            activation, pad_slot_id, null_block_id, run_mode, head_num, update_bound, output);
+        return output;
+    }
+    EXEC_NPU_CMD(aclnnCausalConv1d,
+                    x,
+                    weight,
+                    bias_opt,
+                    conv_state,
+                    query_start_loc_opt,
+                    cache_indices_opt,
+                    initial_state_mode_opt,
+                    num_accepted_tokens_opt,
+                    activation_mode,
+                    pad_slot_id,
+                    run_mode,
+                    output
+                );
+
+    return output;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
     int64_t k,
@@ -3192,6 +3239,21 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor out_is_masked_token_mask, Tensor out_new_token_indices, Tensor out_hidden_state_mapping)"
     );
     ops.impl("npu_copy_and_expand_eagle_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_eagle_inputs);
+    ops.def(
+        "npu_causal_conv1d_custom(Tensor output, Tensor x, "
+        "                         Tensor weight, "
+        "                         Tensor conv_state, "
+        "                         Tensor? bias_opt, "
+        "                         Tensor? query_start_loc_opt, "
+        "                         Tensor? cache_indices_opt, "
+        "                         Tensor? initial_state_mode_opt, "
+        "                         Tensor? num_accepted_tokens_opt, "
+        "                         int activation_mode, "
+        "                         int pad_slot_id, "
+        "                         int run_mode, int max_query_len=-1"
+        ") -> (Tensor output)");
+    ops.impl("npu_causal_conv1d_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_custom);
+
     ops.def(
         "moe_gating_top_k_hash("
         "Tensor x, "
