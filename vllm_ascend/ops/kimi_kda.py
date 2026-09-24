@@ -417,8 +417,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             raise ValueError(f"Unsupported causal_conv1d run_mode: {run_mode}")
 
         output = torch.empty_like(mixed_qkv)
-        # CausalConv1dV2 fast path (aclnnCausalConv1dV2, ported from PR #16468):
-        # dim-last layout, host-metadata friendly, spec-decode aware.
+        # CausalConv1dV2 (aclnnCausalConv1dV2): dim-last layout, host-side
+        # metadata (ACLGraph friendly) and spec-decode aware (maxQueryLen).
         if envs.VLLM_ASCEND_ENABLE_CAUSAL_CONV1D_V2:
             initial = None
             if initial_state_mode is not None:
@@ -440,7 +440,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 run_mode,
                 mixed_qkv.shape[0] if run_mode == 0 else max_query_len,
             )
-                # Legacy path: fla_npu causal_conv1d_update (unchanged when V2 disabled).
+        # Legacy path: fla_npu causal_conv1d_update (unchanged when V2 disabled).
         return causal_conv1d_update(
             mixed_qkv,
             conv_state,
@@ -630,7 +630,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 spec_conv_meta.cache_indices,
                 None,
                 run_mode=1,
-                max_query_len=self.num_spec + 1,
                 num_accepted_tokens=spec_conv_meta.num_accepted_tokens,
                 max_query_len=self._conv_max_query_len,
             )
