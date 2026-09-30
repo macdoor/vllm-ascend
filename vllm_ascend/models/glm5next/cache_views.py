@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pooled-cache physical views for GLM-Next on Model Runner V1."""
+"""Pooled-cache physical views and copy-on-write layout for GLM-Next."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -136,6 +136,59 @@ def view_glm5_next_cache(
         if get_kv_cache_compression_ratio(kv_cache_spec) > 1:
             return _view_compressed_indexer_cache(layer_name, kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
         _k_dim, v_dim = get_kv_cache_dims(layer_name, kv_cache_spec)
-        if v_dim == 0:
+        if v_dim == 0 and kv_cache_spec.page_size_bytes == kv_cache_spec.unpadded_page_size_bytes:
             return _view_nope_main_mla_cache(kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
     return None
+
+
+def build_kv_cache_copy_views(
+    kv_cache_config: KVCacheConfig,
+    get_layer_cache: Callable[[str], torch.Tensor | Sequence[torch.Tensor]],
+    runner_caches: Iterable[torch.Tensor | Sequence[torch.Tensor]],
+) -> list[torch.Tensor]:
+    """Expose one raw page per shared slot to upstream block copies.
+
+    ``copy_kv_cache_blocks_inplace`` copies the first tensor with a given
+    ``data_ptr`` and skips the rest. Indexer rows and the tail ring share a
+    small page but use different shapes, so the copy list has to be that
+    page. Layer bindings are left unchanged. Runner views that start at a
+    page already listed here are omitted; other caches are copied as
+    themselves. Packed regions that do not share a page origin stay separate.
+    """
+    page_views: list[torch.Tensor] = []
+    covered_origins: set[int] = set()
+    num_blocks = kv_cache_config.num_blocks
+    for descriptor in kv_cache_config.kv_cache_tensors:
+        if (
+            len(descriptor.layers) < 2
+            or descriptor.layer_stride != 0
+            or num_blocks <= 0
+            or descriptor.block_stride <= 0
+        ):
+            continue
+        caches = [get_layer_cache(name) for name in descriptor.layers]
+        first_components = [cache if isinstance(cache, torch.Tensor) else cache[0] for cache in caches]
+        first = first_components[0]
+        if any(tensor.data_ptr() != first.data_ptr() for tensor in first_components[1:]):
+            continue
+        storage = first.untyped_storage()
+        base = first.storage_offset() * first.element_size()
+        page_bytes = num_blocks * descriptor.block_stride
+        if base + page_bytes > storage.nbytes():
+            raise ValueError(
+                f"Shared KV page does not fit its storage: offset={base}, page={page_bytes}, storage={storage.nbytes()}."
+            )
+        page_views.append(
+            torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+                storage, base, (num_blocks, descriptor.block_stride)
+            )
+        )
+        covered_origins.add(first.data_ptr())
+
+    copy_views = list(page_views)
+    for cache in runner_caches:
+        for tensor in (cache,) if isinstance(cache, torch.Tensor) else cache:
+            if tensor.numel() == 0 or tensor.data_ptr() in covered_origins:
+                continue
+            copy_views.append(tensor)
+    return copy_views
