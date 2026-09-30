@@ -155,6 +155,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             raise ValueError("GLM AscendC KDA requires linear_lower_bound in [-5, 0).")
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
+        self._conv_max_query_len = 1 + num_spec
         self.conv_size = config.linear_conv_kernel_dim
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
@@ -419,6 +420,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 conv_meta.cache_indices,
                 run_mode=1,
                 num_accepted_tokens=conv_meta.num_accepted_tokens,
+                max_query_len=self._conv_max_query_len,
             )
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
@@ -447,6 +449,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 conv_meta.query_start_loc,
                 conv_meta.cache_indices,
                 run_mode=1,
+                max_query_len=1,
             )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
 
