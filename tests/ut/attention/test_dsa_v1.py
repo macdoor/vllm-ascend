@@ -637,6 +637,37 @@ def test_dsa_cp_device_local_metadata_is_deferred_and_reused():
     assert first_builder.local_query_start_loc.data_ptr() == first_qsl_address
 
 
+def test_qli_lengths_refresh_for_each_builder_when_metadata_is_reused():
+    """Packed cache groups share tiling metadata, but own their length buffers."""
+    builders = [_make_builder(), _make_builder()]
+    addresses = [(b.qli_seqused_k.data_ptr(), b.qli_cmp_residual_k.data_ptr()) for b in builders]
+    generated_metadata = torch.arange(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_quant_lightning_indexer_v2_metadata",
+        create=True,
+        return_value=generated_metadata,
+    ) as metadata_op:
+        for lengths in ([1965, 130], [1968, 133]):
+            cache: dict[str, Any] = {}
+            seq_lens = torch.tensor(lengths, dtype=torch.int32)
+            for builder in builders:
+                metadata = builder._build_qli_metadata(
+                    metadata_cache=cache,
+                    query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+                    seq_lens=seq_lens,
+                    max_seqlen_q=1,
+                    max_seqlen_kv=max(lengths),
+                )
+                torch.testing.assert_close(builder.qli_seqused_k[:2], seq_lens // 4)
+                torch.testing.assert_close(builder.qli_cmp_residual_k[:2], seq_lens % 4)
+                torch.testing.assert_close(metadata, generated_metadata)
+        assert metadata_op.call_count == 2
+
+    assert addresses == [(b.qli_seqused_k.data_ptr(), b.qli_cmp_residual_k.data_ptr()) for b in builders]
+
+
 def test_dsa_cp_qli_metadata_uses_host_maxima():
     builder = _make_cp_builder()
     seq_lens = torch.tensor([8, 6], dtype=torch.int32)
@@ -1005,6 +1036,131 @@ def test_build_classifies_short_speculative_extends_as_decodes(
         assert torch.equal(shared_metadata["cos"], expected)
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seq_len", [127, 128, 129, 133, 261])
+def test_build_req_metadata_uses_execution_window_for_sas(deferred: bool, causal: bool, seq_len: int):
+    config = _make_vllm_config(num_speculative_tokens=5)
+    config.model_config.hf_config.sliding_window = 128
+    config.speculative_config.method = "dspark"
+    with patch(f"{__name__}._make_vllm_config", return_value=config):
+        builder = _make_builder(compressor_ratio=1, num_speculative_tokens=5)
+    if deferred:
+        builder.enable_device_metadata()
+    builder._build_qli_metadata = MagicMock(return_value=None)
+    builder.num_actual_tokens = 5
+    builder.num_decodes = 1
+    builder.num_decode_tokens = 5
+    builder.num_prefills = 0
+    builder.seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    builder.block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=1,
+        num_input_tokens=5,
+        positions=torch.arange(seq_len - 5, seq_len),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        causal=causal,
+    )
+    metadata_op = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    plan = _mock_dsa_kv_plan(
+        get_dsa_sparse_attn_metadata_op=metadata_op,
+        get_dsa_sparse_attn_metadata_kwargs={},
+    )
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        metadata = builder.build_req_metadata(
+            common_attn_metadata=common,
+            seq_lens_cpu=builder.seq_lens,
+            num_actual_reqs=None,
+            cos=torch.ones(5),
+            sin=torch.zeros(5),
+        )
+        if deferred:
+            metadata_op.assert_not_called()
+            for task in builder.take_device_metadata_tasks():
+                task.run()
+    expected_left = 127 if causal else 132
+    metadata_op.assert_called_once()
+    assert metadata_op.call_args.kwargs["ori_win_left"] == metadata.ori_win_left == expected_left
+    assert metadata_op.call_args.kwargs["ori_win_right"] == metadata.ori_win_right == 0
+    assert metadata_op.call_args.kwargs["ori_mask_mode"] == (4 if causal else 0)
+    expected_visible = seq_len if causal else min(seq_len, 133)
+    assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [expected_visible]
+    if not causal:
+        assert (metadata.dspark_swa_indices >= 0).sum(-1).tolist() == [[expected_visible]] * 5
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("seq_len", [127, 128, 129, 133, 261])
+def test_build_draft_req_metadata_plans_shared_visible_kv(deferred: bool, seq_len: int):
+    config = _make_vllm_config(num_speculative_tokens=5)
+    config.model_config.hf_config.sliding_window = 128
+    with patch(f"{__name__}._make_vllm_config", return_value=config):
+        builder = _make_builder(compressor_ratio=1, num_speculative_tokens=5)
+    if deferred:
+        builder.enable_dspark_device_metadata(max_num_tokens=16)
+    metadata_op = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    plan = _mock_dsa_kv_plan(
+        get_dsa_sparse_attn_metadata_op=metadata_op,
+        get_dsa_sparse_attn_metadata_kwargs={},
+    )
+    with patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan):
+        metadata = _build_draft_req_metadata(
+            builder,
+            torch.tensor([seq_len], dtype=torch.int32),
+            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            torch.tensor([0, 5], dtype=torch.int32),
+        )
+        if deferred:
+            metadata_op.assert_not_called()
+            for task in builder.take_device_metadata_tasks():
+                task.run()
+    metadata_op.assert_called_once()
+    expected_visible = min(seq_len, 133)
+    assert metadata_op.call_args.kwargs["ori_mask_mode"] == 0
+    assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [expected_visible]
+    assert metadata.seq_lens.tolist() == [seq_len]
+    assert (metadata.dspark_swa_indices >= 0).sum(-1).tolist() == [[expected_visible]] * 5
+
+
+def test_build_reuses_batched_slot_values_in_persistent_buffer():
+    builder = _make_builder(compressor_ratio=1)
+    count = 3
+    expected = torch.tensor([[4, 7], [-1, -1], [8, 0]], dtype=torch.int32)
+    pointer = builder.slot_mapping.data_ptr()
+    lengths = torch.tensor([10], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=count,
+        num_input_tokens=count,
+        seq_lens=lengths,
+        block_table_tensor=torch.tensor([[4, 8]], dtype=torch.int32),
+        attn_state=MagicMock(),
+    )
+    shared = dict(
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=count,
+        num_prefill_tokens=0,
+        seq_lens=lengths,
+        seq_lens_cpu=lengths,
+        cos=torch.ones(count),
+        sin=torch.zeros(count),
+    )
+    builder.build_req_metadata = MagicMock()
+    with patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan") as plan:
+        builder.build(0, common, common_ratio_to_sas_metadata=shared, formatted_slot_mapping=expected)
+    plan.assert_not_called()
+    assert builder.slot_mapping.data_ptr() == pointer
+    torch.testing.assert_close(builder.slot_mapping[:count], expected, rtol=0, atol=0)
+    expected.zero_()
+    assert builder.slot_mapping[0, 0] == 4
+
+
 def test_build_req_metadata_preserves_zero_max_sequence_lengths():
     builder = _make_builder(compressor_ratio=1)
     builder.common_ratio_to_sas_metadata = {}
@@ -1032,11 +1188,10 @@ def test_build_req_metadata_preserves_zero_max_sequence_lengths():
     )
 
     sas_kwargs = builder._build_sas_metadata.call_args.kwargs
-    qli_kwargs = builder._build_qli_metadata.call_args.kwargs
     assert sas_kwargs["max_seqlen_q"] == 0
     assert sas_kwargs["max_seqlen_kv"] == 0
-    assert qli_kwargs["max_seqlen_q"] == 0
-    assert qli_kwargs["max_seqlen_kv"] == 0
+    builder._build_qli_metadata.assert_not_called()
+    assert metadata.qli_metadata is None
     assert metadata.num_compressed_tokens == 0
 
 

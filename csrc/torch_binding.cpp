@@ -25,6 +25,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
+#include <torch_npu/csrc/aten/common/from_blob.h>
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include <torch_npu/csrc/npu/Module.h>
 #include "ops.h"
@@ -43,7 +44,7 @@
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
-#include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
+#include "attention/kv_quant_sparse_flash_attention_vllm/kv_quant_sparse_flash_attention_vllm_torch_adpt.h"
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
 #include "attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h"
 #include "attention/fused_scatter_copy_sparse_flash_attention/fused_scatter_copy_sparse_flash_attention_torch_adpt.h"
@@ -61,6 +62,7 @@
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
+#include "gmm/gmm_dequant_situ_quant/gmm_dequant_situ_quant_torch_adpt.h"
 #include "moe/grouped_matmul_situ_quant/grouped_matmul_situ_quant_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
@@ -83,6 +85,40 @@
 #include <vector>
 
 namespace vllm_ascend {
+
+c10::optional<at::Tensor> get_npu_view_from_cpu_tensor(const at::Tensor& cpu_tensor)
+{
+    TORCH_CHECK(cpu_tensor.defined(), "UVA view requires a defined CPU tensor");
+    TORCH_CHECK(cpu_tensor.device().is_cpu(), "UVA view requires a CPU tensor");
+    TORCH_CHECK(cpu_tensor.layout() == at::kStrided, "UVA view requires strided layout");
+
+    const c10::Device npu_device(c10::DeviceType::PrivateUse1, c10_npu::current_device());
+    const auto options = at::TensorOptions().dtype(cpu_tensor.scalar_type()).device(npu_device);
+    if (cpu_tensor.numel() == 0) {
+        return at::empty_strided(cpu_tensor.sizes(), cpu_tensor.strides(), options);
+    }
+
+    if (!cpu_tensor.is_pinned()) {
+        return c10::nullopt;
+    }
+    // Query the registered storage base, then apply the logical tensor offset.
+    // torch_npu's host allocator remains the sole register/unregister owner.
+    const auto* host_base = cpu_tensor.storage().data_ptr().get();
+    if (host_base == nullptr) {
+        return c10::nullopt;
+    }
+    c10_npu::NPUGuard guard(npu_device);
+    void* mapped_base = nullptr;
+    const aclError ret = aclrtHostGetDevicePointer(const_cast<void*>(host_base), &mapped_base, 0);
+    if (ret != ACL_SUCCESS || mapped_base == nullptr) {
+        return c10::nullopt;
+    }
+    auto* mapped_data = static_cast<char*>(mapped_base) +
+                        cpu_tensor.storage_offset() * cpu_tensor.element_size();
+    auto keep_cpu_alive = [base = cpu_tensor](void*) mutable {};
+    return at_npu::native::from_blob(mapped_data, cpu_tensor.sizes(), cpu_tensor.strides(),
+                                     0, keep_cpu_alive, options, npu_device);
+}
 
 // user_device_id is the ordinal passed to torch.npu.set_device/aclrtSetDevice,
 // not a vLLM local rank or an ASCEND_RT_VISIBLE_DEVICES entry.
@@ -1390,7 +1426,8 @@ at::Tensor npu_quant_lightning_indexer_v2_metadata_npu(
     std::string layout_k_str = std::string(layout_k);
     char *layout_k_ptr = const_cast<char *>(layout_k_str.c_str());
 
-    EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata, cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
+    EXEC_NPU_CMD(aclnnVllmAscendQuantLightningIndexerV2Metadata,
+                 cu_seqlens_q_val, cu_seqlens_k_val, seqused_q_val, seqused_k_val,
                  cmp_residual_k_val, num_heads_q, num_heads_k, head_dim, topk, quant_mode, batch_size, max_seqlen_q,
                  max_seqlen_k, layout_q_ptr, layout_k_ptr, mask_mode, cmp_ratio, output);
 
@@ -2822,6 +2859,9 @@ at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
 // Pybind on Ascend 310P
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+    ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
+    ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::get_npu_view_from_cpu_tensor);
     ops.def("get_physical_device_id(int user_device_id) -> int");
     ops.impl("get_physical_device_id", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_physical_device_id);
@@ -2877,6 +2917,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+    ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
+    ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::get_npu_view_from_cpu_tensor);
     ops.def("get_physical_device_id(int user_device_id) -> int");
     ops.impl("get_physical_device_id", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_physical_device_id);
@@ -2919,6 +2962,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "              bool activate_left=False, "
         "              int dst_type=36) -> (Tensor y, Tensor mxscale)");
     ops.impl("situ_mx_quant", torch::kPrivateUse1, &vllm_ascend::situ_mx_quant);
+
+    ops.def(
+        "gmm_dequant_situ_quant(Tensor x, Tensor[] weight, Tensor[] weight_scale, "
+        "Tensor x_scale, Tensor group_list, Tensor[] weight_assist_matrix, "
+        "float beta=1.0, float? linear_beta=None, int group_list_type=1) -> (Tensor y, Tensor scale)");
+    ops.impl("gmm_dequant_situ_quant", torch::kPrivateUse1, &vllm_ascend::gmm_dequant_situ_quant);
 
     ops.def(
         "grouped_matmul_situ_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor? weight_assist_matrix, "
@@ -3198,7 +3247,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_sparse_flash_mla);
 
     ops.def(
-        "npu_kv_quant_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"
+        "npu_kv_quant_sparse_flash_attention_vllm(Tensor query, Tensor key, Tensor value,"
         "                                    Tensor sparse_indices, float scale_value, *,"
         "                                    int key_quant_mode=1, int value_quant_mode=1,"
         "                                    Tensor? key_dequant_scale=None,"
@@ -3218,8 +3267,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                    bool return_softmax_lse=False)"
         " -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
-    ops.impl("npu_kv_quant_sparse_flash_attention", torch::kPrivateUse1,
-             &vllm_ascend::npu_kv_quant_sparse_flash_attention);
+    ops.impl("npu_kv_quant_sparse_flash_attention_vllm", torch::kPrivateUse1,
+             &vllm_ascend::npu_kv_quant_sparse_flash_attention_vllm);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

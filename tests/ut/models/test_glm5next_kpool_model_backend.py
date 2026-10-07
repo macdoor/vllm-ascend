@@ -81,13 +81,13 @@ def _indexer_metadata(num_tokens: int = 8) -> AscendIndexerKPoolMetadata:
             dtype=torch.int64,
         )[:num_tokens],
         seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         positions=torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 0, 0])[:num_tokens],
         block_size=2,
         compress_ratio=4,
         cum_query_lens=torch.tensor([4, 8], dtype=torch.int32),
         raw_seq_lens=torch.tensor([4, 4], dtype=torch.int32),
-        num_tokens=num_tokens,
-        max_pool_seq_len=1,
+        num_actual_tokens=8,
     )
 
 
@@ -218,21 +218,10 @@ class _RecordingKPool(nn.Module):
         return None
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
 def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     monkeypatch,
     graph_mode,
-=======
-@pytest.mark.parametrize(
-    "num_tokens,max_pool_seq_len",
-    [(1, 1), (2, 2)],
-)
-def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
-    monkeypatch,
-    num_tokens,
-    max_pool_seq_len,
->>>>>>> origin/pr-16936-new
 ) -> None:
     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
     nn.Module.__init__(backend)
@@ -263,15 +252,11 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
         "get_forward_context",
         lambda: SimpleNamespace(
             attn_metadata={"indexer.tail": tail_metadata},
-<<<<<<< HEAD
             cudagraph_runtime_mode=graph_mode,
-=======
->>>>>>> origin/pr-16936-new
             virtual_engine=0,
         ),
     )
 
-<<<<<<< HEAD
     # A 64-row graph bucket does not imply reuse for eight one-token requests.
     normalized_q_c = torch.arange(128, dtype=torch.float32).reshape(64, 2)
     hidden = torch.ones(64, 3)
@@ -283,18 +268,6 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     metadata.block_table = torch.zeros(8, 1, dtype=torch.int32)
     metadata.positions = torch.zeros(64, dtype=torch.int64)
     metadata.slot_mapping = torch.full((64,), -1, dtype=torch.int64)
-=======
-    normalized_q_c = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    hidden = torch.ones(2, 3)
-    metadata = _indexer_metadata(num_tokens=2)
-    metadata.num_tokens = num_tokens
-    metadata.max_pool_seq_len = max_pool_seq_len
-    metadata.cum_query_lens = torch.tensor([1, 2], dtype=torch.int32)
-    metadata.raw_seq_lens = torch.tensor([1, 1], dtype=torch.int32)
-    metadata.seq_lens = torch.tensor([0, 0], dtype=torch.int32)
-    metadata.positions = torch.tensor([0, 0])
-    metadata.slot_mapping = torch.tensor([-1, -1])
->>>>>>> origin/pr-16936-new
 
     result = backend.forward(
         hidden,
@@ -305,20 +278,12 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     )
 
     assert result is not None
-    assert result.shape == (num_tokens, 1, 5)
     assert backend.indexer_op.args is not None
-<<<<<<< HEAD
     expected_rows = 64 if graph_mode == CUDAGraphMode.FULL else 8
     assert result.shape[0] == expected_rows
     torch.testing.assert_close(
         backend.indexer_op.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2)
     )
-=======
-    torch.testing.assert_close(
-        backend.indexer_op.args[1], normalized_q_c[:num_tokens].repeat(1, 2).view(num_tokens, 2, 2)
-    )
-    hidden = hidden[:num_tokens]
->>>>>>> origin/pr-16936-new
     expected_k = torch.nn.functional.layer_norm(
         torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
         (2,),
@@ -335,9 +300,5 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     assert backend.indexer_op.args[7] is tail_metadata
     assert backend.indexer_op.kwargs is not None
     assert backend.indexer_op.kwargs["compute_topk"] is True
-<<<<<<< HEAD
     assert backend.indexer_op.kwargs["output_buffer"] is backend.topk_indices_buffer
     assert backend.indexer_op.kwargs["allow_cache_packing"] is (graph_mode != CUDAGraphMode.FULL)
-=======
-    assert backend.indexer_op.kwargs["max_pool_seq_len"] == max_pool_seq_len
->>>>>>> origin/pr-16936-new
