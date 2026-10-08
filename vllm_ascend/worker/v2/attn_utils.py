@@ -612,7 +612,7 @@ def _get_attention_kv_cache_dims(
     return kv_cache_spec.head_size, head_size_v
 
 
-def _adjust_kv_layout(
+def _adjust_dsv4_kv_layout(
     raw_tensor: torch.Tensor,
     cache_shapes: list[tuple[int, ...]],
     cache_dtypes: list[torch.dtype],
@@ -736,7 +736,7 @@ def _view_dsv4_cache(
             cache_dtypes.append(kv_cache_spec.dtype)
             overlap_full_kv_cache = True
 
-    return _adjust_kv_layout(
+    return _adjust_dsv4_kv_layout(
         raw_tensor,
         cache_shapes,
         cache_dtypes,
