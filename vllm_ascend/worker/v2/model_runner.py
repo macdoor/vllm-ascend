@@ -110,6 +110,7 @@ class NPUModelRunner(GPUModelRunner):
 
     execute_model_state: ExecuteModelState | None
     max_num_reqs: int
+    kv_caches: list[torch.Tensor]
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations

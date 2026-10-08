@@ -299,7 +299,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
     if mamba_specs:
         _align_hybrid_attention_page_sizes(kv_cache_spec)
-        common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
+        common_page_size = max(
+            spec.page_size_bytes
+            for spec in (*[kv_cache_spec[name] for name in attention_layer_names], *mamba_specs.values())
+        )
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
             page_size_padded = common_page_size if spec.page_size_bytes < common_page_size else spec.page_size_padded
@@ -681,8 +684,10 @@ def _view_dsv4_cache(
     attn_backend: AttentionBackend,
     kv_cache_config: KVCacheConfig,
     page_stride: int | None = None,
+    *,
+    mla_dims: tuple[int, int] | None = None,
 ) -> list[torch.Tensor]:
-    """Create DSA cache views without applying normal MLA K/V splitting."""
+    """Create attention and cache-only views within each physical page."""
     if page_stride is None:
         page_stride = kv_cache_spec.page_size_bytes
     num_blocks = kv_cache_config.num_blocks
@@ -1286,6 +1291,7 @@ def _reshape_kv_cache_v2(
         if is_dsv4_model and uses_turboquant_groups(kv_cache_config.kv_cache_groups)
         else {}
     )
+    uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
 
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -1418,12 +1424,13 @@ def _reshape_kv_cache_v2(
                     kv_caches[layer_name] = typed_cache.view(kv_cache_shape)
                 continue
 
+
             if isinstance(kv_cache_spec, MambaSpec):
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError(f"Mamba cache for {layer_name} must use one raw tensor.")
                 if uses_padded_page_layout:
                     num_blocks = raw_cache.numel() // kv_cache_spec.page_size_bytes
-                    mamba_cache = _adjust_kv_layout(
+                    mamba_cache = _adjust_dsv4_kv_layout(
                         raw_cache,
                         [(num_blocks, *shape) for shape in kv_cache_spec.shapes],
                         kv_cache_spec.dtypes,
@@ -1431,46 +1438,6 @@ def _reshape_kv_cache_v2(
                     )
                 else:
                     mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
-                if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
-                    raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
-                kv_caches[layer_name] = mamba_cache
-                continue
-
-            views = view_glm5_next_cache(
-                layer_name,
-                kv_cache_spec,
-                raw_cache,
-                attn_backend=group.backend,
-                kernel_block_size=kernel_block_sizes[group.kv_cache_group_id],
-                num_blocks=kv_cache_config.num_blocks,
-                get_kv_cache_dims=_get_attention_kv_cache_dims,
-            )
-            if views is not None:
-                kv_caches[layer_name] = views
-                continue
-
-            if (is_dsv4_model or getattr(kv_cache_spec, "indexes_kv_by_block_stride", False)) and isinstance(
-                kv_cache_spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)
-            ):
-                if not isinstance(raw_cache, torch.Tensor):
-                    raise ValueError(f"DSA cache for {layer_name} must use one raw tensor.")
-                attn_layer = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])[layer_name]
-                mla_dims = None
-                if isinstance(attn_layer, MLAAttention):
-                    mla_dims = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
-                kv_caches[layer_name] = _view_page_strided_cache(
-                    raw_cache,
-                    kv_cache_spec,
-                    group.backend,
-                    kv_cache_config,
-                    dsv4_page_strides.get(layer_name),
-                )
-                continue
-
-            if isinstance(kv_cache_spec, MambaSpec):
-                if not isinstance(raw_cache, torch.Tensor):
-                    raise ValueError(f"Mamba cache for {layer_name} must use one raw tensor.")
-                mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
                 kv_caches[layer_name] = mamba_cache
@@ -1484,6 +1451,38 @@ def _reshape_kv_cache_v2(
                     [tuple(tensor.shape) for tensor in mamba_cache],
                     [tensor.stride() for tensor in mamba_cache],
                     [tensor.is_contiguous() for tensor in mamba_cache],
+                )
+                continue
+
+            glm_cache_views = view_glm5_next_cache(
+                layer_name,
+                kv_cache_spec,
+                raw_cache,
+                attn_backend=group.backend,
+                kernel_block_size=kernel_block_sizes[group.kv_cache_group_id],
+                num_blocks=kv_cache_config.num_blocks,
+                get_kv_cache_dims=_get_attention_kv_cache_dims,
+            )
+            if glm_cache_views is not None:
+                kv_caches[layer_name] = glm_cache_views
+                continue
+
+            if (is_dsv4_model or getattr(kv_cache_spec, "indexes_kv_by_block_stride", False)) and isinstance(
+                kv_cache_spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)
+            ):
+                if not isinstance(raw_cache, torch.Tensor):
+                    raise ValueError(f"DSA cache for {layer_name} must use one raw tensor.")
+                attn_layer = get_layers_from_vllm_config(vllm_config, AttentionLayerBase, [layer_name])[layer_name]
+                mla_dims = None
+                if not is_dsv4_model and isinstance(attn_layer, MLAAttention):
+                    mla_dims = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+                kv_caches[layer_name] = _view_dsv4_cache(
+                    raw_cache,
+                    kv_cache_spec,
+                    group.backend,
+                    kv_cache_config,
+                    dsv4_page_strides.get(layer_name),
+                    mla_dims=mla_dims,
                 )
                 continue
 

@@ -775,6 +775,8 @@ def test_disable_profiling_chunk_for_draft_rejects_invalid_boolean():
         disable_profiling_chunk_for_draft(config),
     ):
         pass
+
+
 @pytest.mark.parametrize("num_steps", [1, 3])
 def test_mtp_capture_uses_runtime_topk_reuse_phases(monkeypatch, num_steps: int) -> None:
     speculator = object.__new__(AscendMTPSpeculator)
