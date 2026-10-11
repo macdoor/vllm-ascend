@@ -32,6 +32,7 @@ class AscendBlockTables(BlockTables):
 
     block_sizes_tensor: torch.Tensor
     kernel_block_sizes_tensor: torch.Tensor
+    is_circular: torch.Tensor | None
 
     if vllm_version_is("0.30.0"):
 
@@ -70,6 +71,7 @@ class AscendBlockTables(BlockTables):
             min_kernel_block_size = min(kernel_block_sizes)
             window_size = (self._triton_block_size + min_kernel_block_size - 1) // min_kernel_block_size + 1
             self._block_table_window_size = triton.next_power_of_2(window_size)
+            self.is_circular = None
             # because we will override these attribute, delete these attribute to
             # make sure it's collected by python gc immediately.
             del self.slot_mappings
@@ -127,6 +129,7 @@ class AscendBlockTables(BlockTables):
             min_kernel_block_size = min(kernel_block_sizes)
             window_size = (self._triton_block_size + min_kernel_block_size - 1) // min_kernel_block_size + 1
             self._block_table_window_size = triton.next_power_of_2(window_size)
+            self.is_circular = None
             # because we will override these attribute, delete these attribute to
             # make sure it's collected by python gc immediately.
             del self.slot_mappings
@@ -138,6 +141,23 @@ class AscendBlockTables(BlockTables):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def configure_circular(self, circular: list[bool]) -> None:
+        """Configure fixed-ring addressing after cache initialization, before capture."""
+        if len(circular) != self.num_kv_cache_groups:
+            raise ValueError("Circular flags must match the number of cache groups.")
+        circular = [ring and enabled for ring, enabled in zip(circular, self._slot_mapping_enabled, strict=True)]
+        if not any(circular):
+            self.is_circular = None
+            return
+        if self.cp_size != 1:
+            raise ValueError("Circular tail caches do not support context parallelism.")
+        if any(
+            ring and block_size != kernel_size
+            for ring, block_size, kernel_size in zip(circular, self.block_sizes, self.kernel_block_sizes, strict=True)
+        ):
+            raise ValueError("Circular caches must retain their physical ring capacity.")
+        self.is_circular = torch.tensor(circular, dtype=torch.bool, device=self.device)
 
     def compute_slot_mappings(
         self,
@@ -170,5 +190,7 @@ class AscendBlockTables(BlockTables):
             BLOCK_TABLE_WINDOW_SIZE=self._block_table_window_size,
             slot_mapping_enabled=slot_mapping_enabled,
             HAS_SLOT_MAPPING_ENABLED=True,
+            is_circular_ptr=self.is_circular,
+            HAS_CIRCULAR=self.is_circular is not None,
         )
         return slot_mappings[:, :num_tokens_padded]
