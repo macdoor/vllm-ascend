@@ -303,6 +303,8 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
     )
     metadata = builder.build(0, common)
     tail = tail_builder.build(0, common)
+    assert metadata.num_tokens == 6
+    assert builder.build_for_cudagraph_capture(common).num_tokens == 6
     assert metadata.positions.tolist() == [0, 1, 2, 3, 0, 0]
     assert metadata.slot_mapping.tolist() == [-1, -1, -1, 0, -1, -1]
     assert metadata.cum_query_lens.tolist() == [4, 5]

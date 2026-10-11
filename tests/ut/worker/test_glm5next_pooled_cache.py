@@ -343,6 +343,9 @@ def test_mrv2_copy_on_write_preserves_pooled_pages_and_layer_bindings(
     config.compilation_config.static_forward_context = bindings
 
     runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.ascend_config = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
+    runner.is_last_pp_rank = False
+    runner.max_num_reqs = config.scheduler_config.max_num_seqs
     runner.device = torch.device("cpu")
     runner.vllm_config = config
     runner.compilation_config = config.compilation_config
@@ -447,7 +450,6 @@ def test_copy_inventory_preserves_other_regions_in_shared_storage(monkeypatch):
     torch.testing.assert_close(pages, expected_pages)
     torch.testing.assert_close(other, expected_other)
     assert torch.all(backing[:8] == 99) and torch.all(backing[80:] == 99)
-
 
 
 def test_standalone_mtp_uses_existing_compressed_cache_allocator(runner_factory):

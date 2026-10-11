@@ -8,8 +8,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import (
@@ -52,19 +51,14 @@ class AscendIndexerKPoolMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     seq_lens: torch.Tensor
-    seq_lens_cpu: torch.Tensor | None
     positions: torch.Tensor
     block_size: int
     compress_ratio: int
+    num_tokens: int
+    max_pool_seq_len: int
     cache_role: str = "indexer"
     cum_query_lens: torch.Tensor | None = None
     raw_seq_lens: torch.Tensor | None = None
-    num_actual_tokens: int = 0
-    # GLM MRV2 capture contract (#16936 lineage): the plain build records the
-    # actual token count; build_for_cudagraph_capture overrides both fields so
-    # FULL-graph replay reads the padded bucket width and the full pool span.
-    num_tokens: int = 0
-    max_pool_seq_len: int = 0
     query_metadata: AscendIndexerKPoolQueryMetadata | None = None
 
 
@@ -198,6 +192,14 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             self._metadata_buffers[key] = buffers
         return buffers
 
+    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata) -> AscendIndexerKPoolMetadata:
+        metadata = self.build(0, common_attn_metadata)
+        # Record padded tokens and the full pool capacity so replay can grow
+        # beyond the dummy batch's short prefix.
+        metadata.num_tokens = metadata.positions.shape[0]
+        metadata.max_pool_seq_len = metadata.block_table.shape[1] * metadata.block_size
+        return metadata
+
     def build(
         self,
         common_prefix_len: int,
@@ -242,24 +244,20 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
             seq_lens_cpu = None
-        if seq_lens_cpu is not None:
-            seq_lens_cpu = torch.div(seq_lens_cpu, self.compress_ratio, rounding_mode="floor")
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         max_pool_seq_len = block_table.shape[1] * self.kernel_row_block_size
         if seq_lens_cpu is not None:
-            max_pool_seq_len = int(seq_lens_cpu.max()) if seq_lens_cpu.numel() else 0
+            max_pool_seq_len = int(seq_lens_cpu.max()) // self.compress_ratio if seq_lens_cpu.numel() else 0
         return AscendIndexerKPoolMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             block_size=self.kernel_row_block_size,
             compress_ratio=self.compress_ratio,
             cum_query_lens=cum_query_lens,
             raw_seq_lens=raw_seq_lens,
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            num_tokens=common_attn_metadata.num_actual_tokens,
+            num_tokens=num_cache_tokens if self.use_dsa_cp else common_attn_metadata.num_actual_tokens,
             max_pool_seq_len=max_pool_seq_len,
             query_metadata=self._build_query_metadata(common_attn_metadata, positions),
         )
@@ -270,20 +268,8 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         attn_state: Any = None,
         **kwargs,
     ) -> AscendIndexerKPoolMetadata:
-        del attn_state
-        return self.build(0, common_attn_metadata, **kwargs)
-
-    def build_for_cudagraph_capture(
-        self, common_attn_metadata: CommonAttentionMetadata, **kwargs: Any
-    ) -> AscendIndexerKPoolMetadata:
-        # GLM MRV2 FULL-graph capture routes through this hook
-        # (worker/v2/attn_utils.py). Record the padded token bucket and the
-        # full pool span so replay can grow beyond the dummy batch's short
-        # prefix (#16936 capture contract).
-        metadata = self.build(0, common_attn_metadata, **kwargs)
-        metadata.num_tokens = common_attn_metadata.num_input_tokens
-        metadata.max_pool_seq_len = metadata.block_table.shape[1] * metadata.block_size
-        return metadata
+        del attn_state, kwargs
+        return self.build_for_cudagraph_capture(common_attn_metadata)
 
     def build_for_drafting(
         self,
@@ -553,15 +539,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         if not isinstance(tail_metadata, AscendIndexerKPoolTailMetadata):
             raise TypeError("GLM KPool backend requires tail-cache metadata.")
 
-        num_tokens = hidden_states.shape[0]
-        if indexer_metadata.query_metadata is None:
-            if context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
-                num_tokens = min(num_tokens, indexer_metadata.num_actual_tokens)
-            else:
-                # FULL capture/replay: trust the padded width recorded at
-                # capture time (build_for_cudagraph_capture), matching the
-                # #16936 contract; replay inputs are padded to that bucket.
-                num_tokens = min(num_tokens, indexer_metadata.num_tokens)
+        num_tokens = min(hidden_states.shape[0], indexer_metadata.num_tokens)
         hidden = hidden_states[:num_tokens]
         k_hidden = k_hidden_states[:num_tokens]
         if self._wk_weight_f32 is None:
