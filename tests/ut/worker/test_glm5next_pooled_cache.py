@@ -481,6 +481,63 @@ def test_copy_inventory_preserves_other_regions_in_shared_storage():
     assert torch.all(backing[:8] == 99) and torch.all(backing[80:] == 99)
 
 
+@pytest.mark.parametrize("layout,alignment_slack", [("split", 0), ("split", 64), ("segmented", 64)])
+def test_copy_inventory_preserves_aliased_component_layouts(layout, alignment_slack):
+    num_blocks = 3
+    if layout == "split":
+        key_raw = torch.full((24 + alignment_slack,), 99, dtype=torch.int8)[:24]
+        value_raw = torch.full((12 + alignment_slack,), 99, dtype=torch.int8)[:12]
+    else:
+        config = SimpleNamespace(kv_transfer_config=SimpleNamespace())
+        with patch.object(attn_utils, "get_current_vllm_config", return_value=config):
+            key_raw, value_raw = attn_utils._allocate_sparse_c8_indexer_tensors(
+                24, 12, 64, torch.float32, torch.device("cpu")
+            )
+    components = (key_raw.view(num_blocks, 8), value_raw.view(torch.float32).view(num_blocks, 1))
+    bindings = {"first": components, "second": components}
+    plan = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[SimpleNamespace(layers=list(bindings), layer_stride=0, block_stride=12, size=36)],
+        kv_cache_groups=[],
+    )
+    storages = {
+        tensor.untyped_storage().data_ptr(): torch.empty(0, dtype=torch.uint8).set_(tensor.untyped_storage())
+        for tensor in components
+    }
+    for storage in storages.values():
+        storage.fill_(99)
+    for tensor in components:
+        for block_id, value in enumerate((11, 22, 33)):
+            tensor[block_id].fill_(value)
+    expected = {ptr: storage.clone() for ptr, storage in storages.items()}
+    for tensor in components:
+        offset = tensor.storage_offset() * tensor.element_size()
+        size = tensor.numel() * tensor.element_size()
+        pages = expected[tensor.untyped_storage().data_ptr()][offset : offset + size].view(num_blocks, -1)
+        pages[[1, 2]] = pages[[0, 1]]
+
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.kv_cache_config = plan
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
+        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
+    )
+    runner.kv_caches = build_kv_cache_copy_views(
+        plan, bindings.__getitem__, [tuple(tensor.view_as(tensor) for tensor in components)] * 2
+    )
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_block_copies = [
+        KVCacheBlockCopy(src_block_id=0, dst_block_id=1),
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=2),
+    ]
+    runner.update_requests(scheduler_output)
+
+    for ptr, storage in storages.items():
+        torch.testing.assert_close(storage, expected[ptr])
+    assert all(cache is components for cache in bindings.values())
+
+
 def test_standalone_mtp_uses_existing_compressed_cache_allocator(runner_factory):
     config = _make_config()
     specs = {name: spec for name, spec in _make_specs().items() if not isinstance(spec, MambaSpec)}

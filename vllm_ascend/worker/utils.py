@@ -30,18 +30,48 @@ def build_kv_cache_copy_views(
         caches = [get_layer_cache(name) for name in descriptor.layers]
         first_components = [cache if isinstance(cache, torch.Tensor) else cache[0] for cache in caches]
         first = first_components[0]
-        # Packed regions start at different addresses and retain their own
-        # block strides. Only views with the same page origin alias pages.
+        # A shared origin proves aliasing, but not block-major allocation:
+        # K/V may use separate storages or separate segments of one storage.
         if any(tensor.data_ptr() != first.data_ptr() for tensor in first_components[1:]):
             continue
         storage = first.untyped_storage()
         base = first.storage_offset() * first.element_size()
-        assert base + descriptor.size <= storage.nbytes()
-        pages = torch.empty(0, dtype=torch.uint8, device=first.device).set_(
-            storage, base, (kv_cache_config.num_blocks, descriptor.block_stride)
-        )
-        copy_caches.append(pages)
-        shared_page_ranges.append((pages.device, pages.data_ptr(), pages.data_ptr() + pages.numel()))
+        components = [
+            tensor
+            for cache in caches
+            for tensor in ((cache,) if isinstance(cache, torch.Tensor) else cache)
+            if tensor.numel()
+        ]
+        if not components or base + descriptor.size > storage.nbytes():
+            continue
+        # Every component must advance by one physical page per scheduler
+        # block and fit entirely within that page, including kernel splits.
+        for tensor in components:
+            if (
+                tensor.device != first.device
+                or tensor.untyped_storage().data_ptr() != storage.data_ptr()
+                or tensor.shape[0] % kv_cache_config.num_blocks
+            ):
+                break
+            blocks = tensor.unflatten(0, (kv_cache_config.num_blocks, tensor.shape[0] // kv_cache_config.num_blocks))
+            page_end = (
+                tensor.data_ptr()
+                - first.data_ptr()
+                + tensor.element_size()
+                * (1 + sum((size - 1) * stride for size, stride in zip(blocks.shape[1:], blocks.stride()[1:])))
+            )
+            if (
+                blocks.stride(0) * tensor.element_size() != descriptor.block_stride
+                or tensor.data_ptr() < first.data_ptr()
+                or page_end > descriptor.block_stride
+            ):
+                break
+        else:
+            pages = torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+                storage, base, (kv_cache_config.num_blocks, descriptor.block_stride)
+            )
+            copy_caches.append(pages)
+            shared_page_ranges.append((pages.device, pages.data_ptr(), pages.data_ptr() + pages.numel()))
 
     for cache in runner_caches:
         for tensor in (cache,) if isinstance(cache, torch.Tensor) else cache:
