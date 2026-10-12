@@ -36,12 +36,13 @@ def build_kv_cache_copy_views(
             continue
         storage = first.untyped_storage()
         base = first.storage_offset() * first.element_size()
-        components = [
-            tensor
-            for cache in caches
-            for tensor in ((cache,) if isinstance(cache, torch.Tensor) else cache)
-            if tensor.numel()
-        ]
+        components: list[torch.Tensor] = []
+        for cache in caches:
+            if isinstance(cache, torch.Tensor):
+                tensors = cache.unbind(0) if cache.ndim == 5 and cache.shape[0] == 2 else (cache,)
+            else:
+                tensors = cache
+            components.extend(tensor for tensor in tensors if tensor.numel())
         if not components or base + descriptor.size > storage.nbytes():
             continue
         # Every component must advance by one physical page per scheduler
