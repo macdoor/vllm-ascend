@@ -8,14 +8,16 @@ from itertools import permutations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, MambaSpec, MLAAttentionSpec
-from vllm.v1.worker import utils as worker_utils
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -390,8 +392,6 @@ def test_mrv2_copy_on_write_preserves_pooled_pages_and_layer_bindings(
         runner.initialize_kv_cache(plan)
 
     assert all(isinstance(cache, torch.Tensor) and cache.numel() > 0 for cache in runner.kv_caches)
-    for name, cache in caches.items():
-        assert bindings[name].kv_cache is cache
 
     # Copy a chain using the original source pages. Copying an aliased backing
     # twice would incorrectly propagate page 0 into page 2.
@@ -408,11 +408,22 @@ def test_mrv2_copy_on_write_preserves_pooled_pages_and_layer_bindings(
         small_pages[page_id].fill_(value)
     expected_small = small_pages.clone()
     expected_small[[1, 2]] = small_pages[[0, 1]]
-    with patch.object(
-        worker_utils, "async_tensor_h2d", side_effect=lambda data, device: torch.as_tensor(data, device=device)
-    ):
-        worker_utils.copy_kv_cache_blocks_inplace(runner.kv_caches, plan.num_blocks, [(0, 1), (1, 2)])
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
+        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
+    )
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.kv_cache_block_copies = [
+        KVCacheBlockCopy(src_block_id=0, dst_block_id=1),
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=2),
+    ]
+    # UT setup installs the worker patches, so this exercises the Ascend copy
+    # implementation with the inventory installed by initialize_kv_cache.
+    runner.update_requests(scheduler_output)
 
+    for name, cache in caches.items():
+        assert bindings[name].kv_cache is cache
     for page_id, value in enumerate((11, 11, 22)):
         assert torch.all(main_pages[page_id] == value)
     torch.testing.assert_close(small_pages, expected_small)
@@ -423,7 +434,7 @@ def test_mrv2_copy_on_write_preserves_pooled_pages_and_layer_bindings(
         assert torch.all(storage[raw.storage_offset() + raw.numel() :] == 99)
 
 
-def test_copy_inventory_preserves_other_regions_in_shared_storage(monkeypatch):
+def test_copy_inventory_preserves_other_regions_in_shared_storage():
     backing = torch.full((88,), 99, dtype=torch.uint8)
     pages = backing[8:56].view(3, 16)
     other = backing[56:80].view(3, 8)
@@ -436,7 +447,14 @@ def test_copy_inventory_preserves_other_regions_in_shared_storage(monkeypatch):
         kv_cache_tensors=[SimpleNamespace(layers=list(bindings), layer_stride=0, block_stride=16, size=48)],
         kv_cache_groups=[],
     )
-    inventory = build_kv_cache_copy_views(
+    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
+    runner.kv_cache_config = plan
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
+        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
+    )
+    runner.kv_caches = build_kv_cache_copy_views(
         plan,
         bindings.__getitem__,
         [
@@ -448,8 +466,15 @@ def test_copy_inventory_preserves_other_regions_in_shared_storage(monkeypatch):
     expected_pages, expected_other = pages.clone(), other.clone()
     expected_pages[[1, 2]] = pages[[0, 1]]
     expected_other[[1, 2]] = other[[0, 1]]
-    monkeypatch.setattr(worker_utils, "async_tensor_h2d", lambda data, device: torch.as_tensor(data, device=device))
-    worker_utils.copy_kv_cache_blocks_inplace(inventory, plan.num_blocks, [(0, 1), (1, 2)])
+    scheduler_output = SchedulerOutput.make_empty()
+    unchanged = backing.clone()
+    runner.update_requests(scheduler_output)
+    torch.testing.assert_close(backing, unchanged)
+    scheduler_output.kv_cache_block_copies = [
+        KVCacheBlockCopy(src_block_id=0, dst_block_id=1),
+        KVCacheBlockCopy(src_block_id=1, dst_block_id=2),
+    ]
+    runner.update_requests(scheduler_output)
 
     torch.testing.assert_close(pages, expected_pages)
     torch.testing.assert_close(other, expected_other)
