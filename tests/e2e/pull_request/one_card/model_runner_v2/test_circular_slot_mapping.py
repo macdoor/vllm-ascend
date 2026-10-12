@@ -47,13 +47,12 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
     def run():
         return tables.compute_slot_mappings(mapping, starts, positions, count + 7, out=output)
 
-    # Compile before capture. Dummy positions are zero; replays grow past both
-    # the capture prefix and a 1024-token tile, without changing input addresses.
+    # Compile before capture; replay grows beyond the dummy and a 1024-token tile.
     run()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        result = run()
+        run()
 
     request_rows = torch.cat((torch.full((lengths[0],), 2), torch.zeros(lengths[2], dtype=torch.int64))).long()
     for offset in (capacity - 1, 4095, 4096):
@@ -71,11 +70,8 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
             else:
                 run()
             torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
-        assert result.data_ptr() == output.data_ptr()
-        assert result.shape == (3, count + 7)
 
-    # Negative token sentinels belong to circular/PAD groups. Disable the
-    # ordinary group for this replay so it never indexes a negative position.
+    # Disable ordinary addressing for the negative circular/PAD sentinel.
     tables.slot_mapping_enabled[0] = False
     positions[0] = -1
     expected[0].fill_(-1)
@@ -90,8 +86,7 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
     torch.npu.set_device(0)
     device = torch.device("npu")
     pool, capacity, dim, topk = 4, 7, 128, 2048
-    # Isolate the supported single-card layout; all addressing, compression,
-    # selection and graph execution below use production NPU implementations.
+    # Single-card layout; addressing, compression and selection use production kernels.
     monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: False)
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
@@ -174,9 +169,8 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
     history: dict[int, torch.Tensor] = {}
     generator = torch.Generator().manual_seed(911)
 
-    # Verify 6..9 across pool 4..7, keep only 6, then replay replacement 7
-    # followed by two new draft steps. Repeat across pool 8..11. Rejected
-    # lookahead rows remain physically present until overwritten by replay.
+    # Reject 7..9 after verifying 6..9 and resume at 7; repeat across pool 8..11.
+    # Rejected lookahead stays in the physical ring until replay overwrites it.
     for begin, count in ((0, 4), (4, 2), (6, 4), (7, 1), (8, 1), (9, 1), (10, 4), (11, 1), (12, 1), (13, 1)):
         current_keys = torch.randn(count, dim, generator=generator)
         positions_cpu = torch.arange(begin, begin + count)

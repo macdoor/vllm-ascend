@@ -31,7 +31,6 @@ from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
-from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2 import pcp_manager as pcp_manager_module
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode.autoregressive import (
@@ -852,7 +851,8 @@ def test_graph_prefill_uses_local_dummy_metadata(attn_architecture: str) -> None
 
 
 @pytest.mark.parametrize("replicated", [False, True])
-def test_capture_preserves_prepared_prefill_inputs(replicated: bool) -> None:
+@pytest.mark.parametrize("num_steps", [1, 3])
+def test_capture_preserves_prepared_prefill_inputs(replicated: bool, num_steps: int) -> None:
     speculator = object.__new__(AscendMTPSpeculator)
     speculator.replicated_pcp = replicated
     speculator.pcp_manager = object()
@@ -860,8 +860,12 @@ def test_capture_preserves_prepared_prefill_inputs(replicated: bool) -> None:
     speculator.last_token_indices = torch.ones(2, dtype=torch.int32)
     speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
     speculator.max_num_reqs = 2
-    speculator.num_speculative_steps = 1
+    speculator.num_speculative_steps = num_steps
+    speculator.share_mtp_topk_indices = True
+    speculator.model = SimpleNamespace(model=MagicMock())
     speculator.prefill_cudagraph_manager = MagicMock(use_breakable_cg=False)
+    speculator.decode_cudagraph_manager = MagicMock()
+    speculator.input_buffers = object()
     speculator.target_input_buffers = object()
     speculator.block_tables = object()
     speculator.attn_groups = []
@@ -887,8 +891,19 @@ def test_capture_preserves_prepared_prefill_inputs(replicated: bool) -> None:
         chosen.assert_called_once_with(metadata, slots)
         unused = speculator._prefill if replicated else upstream_prefill
         unused.assert_not_called()
-    metadata_context.__exit__.assert_called_once()
+    assert metadata_context.__exit__.call_count == (2 if num_steps > 1 else 1)
     assert speculator.model_state.pcp_manager is speculator.pcp_manager
+    assert speculator.last_token_indices.tolist() == speculator.idx_mapping.tolist() == [0, 0]
+    assert [c.args[0] for c in speculator.model.model.set_skip_topk.call_args_list] == (
+        [False, True, False] if num_steps > 1 else [False]
+    )
+    assert [c.kwargs for c in metadata_wrapper.call_args_list] == (
+        [{}, {"for_cudagraph_capture": True}] if num_steps > 1 else [{}]
+    )
+    compact = speculator.model.model.compact_topk_indices
+    assert compact.call_count == (1 if num_steps > 1 else 0)
+    if num_steps > 1:
+        assert compact.call_args.args[0].tolist() == [0, 0]
 
 
 @pytest.mark.parametrize(
@@ -1052,59 +1067,3 @@ def test_disable_profiling_chunk_for_draft_rejects_invalid_boolean():
         disable_profiling_chunk_for_draft(config),
     ):
         pass
-
-
-@pytest.mark.parametrize("num_steps", [1, 3])
-def test_mtp_capture_uses_runtime_topk_reuse_phases(monkeypatch, num_steps: int) -> None:
-    speculator = object.__new__(AscendMTPSpeculator)
-    speculator.replicated_pcp = False
-    speculator.pcp_manager = None
-    speculator.num_speculative_steps = num_steps
-    speculator.max_num_reqs = 2
-    speculator.last_token_indices = torch.full((2,), 7, dtype=torch.int64)
-    speculator.idx_mapping = torch.full((2,), 7, dtype=torch.int32)
-    speculator.share_mtp_topk_indices = True
-    state = SimpleNamespace(skip_topk=True)
-    compact = MagicMock()
-    speculator.model = SimpleNamespace(
-        model=SimpleNamespace(
-            set_skip_topk=lambda skip: setattr(state, "skip_topk", skip),
-            compact_topk_indices=compact,
-        ),
-    )
-    captured = []
-    metadata_module = SimpleNamespace(build_attn_metadata=lambda **kwargs: kwargs)
-    monkeypatch.setattr(attn_utils, "_BUILD_ATTN_METADATA_MODULE", metadata_module)
-    monkeypatch.setattr(attn_utils, "build_attn_metadata", lambda **kwargs: kwargs)
-    speculator.prefill_cudagraph_manager = SimpleNamespace(
-        use_breakable_cg=False,
-        capture=lambda *args, **kwargs: captured.append(
-            ("prefill", state.skip_topk, metadata_module.build_attn_metadata())
-        ),
-    )
-    speculator.decode_cudagraph_manager = SimpleNamespace(
-        capture=lambda *args, **kwargs: captured.append(
-            ("decode", state.skip_topk, metadata_module.build_attn_metadata())
-        ),
-    )
-    speculator.model_state = object()
-    speculator.target_input_buffers = object()
-    speculator.input_buffers = object()
-    speculator.block_tables = object()
-    speculator.target_attn_groups = []
-    speculator.attn_groups = []
-    speculator.kv_cache_config = object()
-
-    speculator.capture()
-
-    assert captured == [("prefill", False, {})] + (
-        [("decode", True, {"for_cudagraph_capture": True})] if num_steps > 1 else []
-    )
-    assert not state.skip_topk
-    assert speculator.idx_mapping.tolist() == [0, 0]
-    assert speculator.last_token_indices.tolist() == [0, 0]
-    if num_steps > 1:
-        compact.assert_called_once()
-        assert compact.call_args.args[0].tolist() == [0, 0]
-    else:
-        compact.assert_not_called()
