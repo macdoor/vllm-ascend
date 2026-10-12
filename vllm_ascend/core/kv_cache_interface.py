@@ -214,8 +214,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
-            "All attention layers in the same KV cache group must be MLAAttentionSpec."
+        # Uniformity probes may include indexer specs, which share the upstream
+        # MLA base class but do not have the main cache's layout metadata.
+        assert all(isinstance(spec, AscendMLAAttentionSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be AscendMLAAttentionSpec."
         )
         ascend_layouts = {
             (
@@ -338,6 +340,15 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     compress_ratio: int = 1
     model_version: str | None = None
     indexes_kv_by_block_stride: bool = False
+    bounded_replay: bool = False
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return not self.bounded_replay
+
+    @property
+    def prefix_replay_tokens(self) -> int:
+        return self.sliding_window if self.bounded_replay else 0
 
     def __post_init__(self):
         pass

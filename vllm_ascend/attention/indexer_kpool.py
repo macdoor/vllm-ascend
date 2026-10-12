@@ -293,7 +293,7 @@ class AscendIndexerKPoolBackend(AttentionBackend):
         return "ASCEND_INDEXER_KPOOL"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # The scheduler manages logical token blocks. Triton consumes complete
         # compressed storage pages with their actual size and strides.
         return [MultipleOf(1)]
@@ -419,7 +419,7 @@ class AscendIndexerKPoolTailBackend(AttentionBackend):
         return "ASCEND_INDEXER_KPOOL_TAIL"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # Ring capacity is independent of the pool size and SFA C128.
         return [MultipleOf(1)]
 

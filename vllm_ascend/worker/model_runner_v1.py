@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -154,6 +154,7 @@ from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+    allocate_shared_indexer_cache,
     apply_layerwise_kv_cache_plan,
     get_layerwise_reuse_config,
 )
@@ -360,98 +361,6 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
-def _iter_kv_tensors(kv_cache: Any) -> Iterator[torch.Tensor]:
-    """Yield every tensor nested inside a kv_cache container."""
-    if isinstance(kv_cache, torch.Tensor):
-        yield kv_cache
-    elif isinstance(kv_cache, (list, tuple)):
-        for item in kv_cache:
-            yield from _iter_kv_tensors(item)
-    elif isinstance(kv_cache, dict):
-        for item in kv_cache.values():
-            yield from _iter_kv_tensors(item)
-
-
-# fp8 storages may not implement zero_(); they are zeroed through an int8
-# reinterpretation (or a scalar broadcast when not contiguous) instead.
-_FP8_DTYPES = frozenset(
-    getattr(torch, name)
-    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
-    if hasattr(torch, name)
-)
-
-
-# Upper bound for one chunked fill of a non-contiguous buffer, so the
-# kernel-side temporary stays small even on a nearly-full card.
-_ZERO_CHUNK_BYTES = 64 * 1024 * 1024
-
-
-def _zero_without_temp_buffer(t: torch.Tensor) -> None:
-    """Zero a tensor in place without allocating a same-size temporary.
-
-    Contiguous tensors are filled through an int8 reinterpretation of the
-    same bytes, which needs no workspace. Non-contiguous ones make even
-    zero_()/copy_() materialize a temporary proportional to the operand
-    size on NPU (a2 CI OOMed with 6-12 GiB extra on a nearly-full card),
-    so they are filled with a scalar broadcast in dim-0 chunks bounded by
-    _ZERO_CHUNK_BYTES.
-    """
-    if t.is_contiguous():
-        t.view(torch.int8).zero_()
-        return
-    if t.dim() == 0 or t.numel() * t.element_size() <= _ZERO_CHUNK_BYTES:
-        t.copy_(torch.zeros((), dtype=t.dtype, device=t.device))
-        return
-    rows_per_chunk = max(1, _ZERO_CHUNK_BYTES // (t[0].numel() * t.element_size()))
-    zero = torch.zeros((), dtype=t.dtype, device=t.device)
-    for start in range(0, t.shape[0], rows_per_chunk):
-        t[start:start + rows_per_chunk].copy_(zero)
-
-
-def _zero_tensor(t: torch.Tensor) -> None:
-    """Zero a tensor in place.
-
-    fp8 storages may not implement zero_() at all, and plain zero_() can
-    itself materialize a same-size temporary for some NPU dtypes/layouts
-    (a2 CI runners: 6-12 GiB extra while the pool is nearly full). Both
-    cases take the no-temporary path. Only OutOfMemoryError is treated as
-    recoverable; any other failure must abort startup loudly rather than
-    leave a poisoned buffer behind.
-    """
-    if t.dtype in _FP8_DTYPES:
-        _zero_without_temp_buffer(t)
-        return
-    try:
-        t.zero_()
-    except torch.OutOfMemoryError:
-        _zero_without_temp_buffer(t)
-
-
-def _zero_static_kv_buffers(runner) -> None:
-    """Zero every KV-cache / recurrent-state tensor in static_forward_context.
-
-    Fix for the GLM-5.3-Flash C8 accuracy collapse: FULL_DECODE_ONLY capture
-    runs dummy decodes that really execute the KDA/SFA write paths over the
-    persistent buffers. On this model the KDA conv/recurrent state caches
-    share backing storage with the SFA fp8 KV pool (per 4-layer group the
-    KDA state tensors and the next SFA pool have the same data_ptr), so the
-    bf16 garbage written by causal_conv1d/recurrent_kda lands in pool blocks
-    0-8; reinterpreted as fp8 e4m3 those bytes include NaN encodings
-    (0x7F/0xFF), which the SFA forward then reads into the residual stream.
-    Nothing resets the buffers after capture, so the first real request
-    reads poisoned state and collapses into emitting '!' forever. Zeroing
-    right after capture_model() restores the logically-empty state the
-    engine assumes at startup. It runs exactly once per startup, outside
-    any captured graph, so graph replay and steady-state inference are
-    unaffected.
-    """
-    compilation_config = getattr(runner, "compilation_config", None)
-    ctx = getattr(compilation_config, "static_forward_context", None) or {}
-    for mod in ctx.values():
-        for tensor in _iter_kv_tensors(getattr(mod, "kv_cache", None)):
-            _zero_tensor(tensor)
-
-
 class NPUModelRunner(GPUModelRunner):
     # vLLM #51718 describes compatible KV cache groups as views over one
     # standardized backing allocation. The default runner preserves that
@@ -539,8 +448,8 @@ class NPUModelRunner(GPUModelRunner):
         self.use_sparse = enable_sfa(vllm_config)
         # Backends that derive per-token visible history from self.positions
         # rather than from seq_lens: the LightningIndexer SFA family and the
-        # GLM-Next kpool indexer. Both reach SparseMLAMetadataState.prepare(),
-        # which calls indexer.get_topk_lengths(positions).
+        # GLM-Next kpool indexer. Both need real positions to select causally
+        # valid sparse indices.
         self.uses_positions_for_attention = self.use_sparse or model_uses_kpool_indexer(
             getattr(vllm_config, "model_config", None)
         )
@@ -5170,6 +5079,10 @@ class NPUModelRunner(GPUModelRunner):
         self.hybrid_with_attn_and_mamba = any(
             isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values()
         ) and any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
+        # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
+        # are, remove this is_step_model exemption: this line and the
+        # `or is_step_model` overlay gate below.
+        is_step_model = self.model_config.hf_text_config.model_type in ("step3p5", "step3p7")
         strided_attention_cache_layers: set[str] = set()
         if (
             not self.use_dcp
@@ -5286,7 +5199,8 @@ class NPUModelRunner(GPUModelRunner):
         if (
             not is_dsv4_main
             and not uses_padded_page_layout
-            and self.hybrid_with_attn_and_mamba
+            and (self.hybrid_with_attn_and_mamba
+                 or is_step_model)
             and not self.use_sparse
             and not self.use_compress
             and kv_cache_config.kv_cache_tensors
@@ -5321,6 +5235,20 @@ class NPUModelRunner(GPUModelRunner):
             # Only the layerwise planner emits zero-stride alias descriptors
             # here. Ordinary vLLM group descriptors retain private layer buffers.
             reuse_slot = layerwise_reuse and kv_cache_tensor.layer_stride == 0
+            if reuse_slot and all(
+                isinstance(layer_kv_cache_spec[name], AscendSFAIndexerCacheSpec) for name in shared_layers
+            ):
+                indexer_specs = {
+                    name: spec for name in shared_layers
+                    if isinstance((spec := layer_kv_cache_spec[name]), AscendSFAIndexerCacheSpec)
+                }
+                kv_cache_raw_tensors.update(
+                    allocate_shared_indexer_cache(
+                        indexer_specs, kv_cache_config.num_blocks,
+                        lambda size: self._allocate_int8_cache_tensor(size, alignment),
+                    )
+                )
+                continue
             allocation_layers = shared_layers[:1] if reuse_slot else shared_layers
             use_mamba = False
             use_compressed_cache = False
@@ -6614,13 +6542,6 @@ class NPUModelRunner(GPUModelRunner):
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False
-
-        # Capture runs dummy forwards that can leave garbage in the static
-        # KV/state buffers (e.g. GLM-5.3-Flash: KDA dummy state lands in the
-        # aliased SFA fp8 pool and reads back as NaN). Zero them once here so
-        # real requests start from the logically-empty state the engine
-        # assumes. See _zero_static_kv_buffers for the full story.
-        _zero_static_kv_buffers(self)
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:

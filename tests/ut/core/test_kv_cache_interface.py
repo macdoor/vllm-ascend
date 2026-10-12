@@ -7,13 +7,15 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
 from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendCircularBufferSpec,
     AscendMLAAttentionSpec,
+    AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
     declared_kwarg,
     get_kv_cache_compression_ratio,
@@ -31,6 +33,22 @@ def _mla_spec():
         head_size=128,
         dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.parametrize("indexer_first", [False, True])
+def test_mixed_mla_indexer_specs_are_not_uniform(indexer_first):
+    main_spec = _mla_spec()
+    indexer_spec = AscendSFAIndexerCacheSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    specs = [("main", main_spec), ("indexer", indexer_spec)]
+    if indexer_first:
+        specs.reverse()
+    assert not is_kv_cache_spec_uniform(dict(specs))
+
+
+def test_matching_ascend_mla_specs_merge():
+    spec = _mla_spec()
+    assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
+    assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
 
 
 def test_get_storage_block_size_and_dcp_memory():
@@ -105,11 +123,6 @@ def _swa_spec(**overrides):
     )
 
 
-@pytest.mark.skipif(
-    not hasattr(SlidingWindowMLASpec, "bounded_replay"),
-    reason="bounded_replay arrives with vLLM #56227. Until the Main2Main pin includes it "
-    "no spec can set the field, so there is nothing for merge to carry.",
-)
 def test_sliding_window_mla_merge_carries_bounded_replay():
     """The Ascend override rebuilds the merged spec instead of calling the
     parent's ``merge``, so upstream's field has to be carried across by hand:
@@ -172,9 +185,8 @@ def test_the_swa_spec_accepts_whatever_the_probe_returns():
     replaying = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True))
     plain = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", False))
 
-    if hasattr(SlidingWindowMLASpec, "bounded_replay"):
-        assert replaying.bounded_replay
-        assert not plain.bounded_replay
+    assert replaying.bounded_replay
+    assert not plain.bounded_replay
 
 
 # --- which layers may declare a replay window --------------------------------
