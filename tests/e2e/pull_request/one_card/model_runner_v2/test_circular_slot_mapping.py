@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
+import vllm_ascend.patch.worker  # noqa: F401
 from vllm_ascend.attention.indexer_kpool import (
     AscendIndexerKPoolMetadataBuilder,
     AscendIndexerKPoolTailMetadata,
@@ -86,7 +87,6 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
     torch.npu.set_device(0)
     device = torch.device("npu")
     pool, capacity, dim, topk = 4, 7, 128, 2048
-    # Single-card layout; addressing, compression and selection use production kernels.
     monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: False)
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
