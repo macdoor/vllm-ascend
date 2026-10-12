@@ -103,7 +103,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
-from vllm_ascend.worker.utils import disable_compilation
+from vllm_ascend.worker.utils import build_kv_cache_copy_views, disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,

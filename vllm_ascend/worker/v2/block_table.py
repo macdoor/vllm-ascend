@@ -32,6 +32,7 @@ class AscendBlockTables(BlockTables):
 
     block_sizes_tensor: torch.Tensor
     kernel_block_sizes_tensor: torch.Tensor
+    is_circular: torch.Tensor | None
 
     if vllm_version_is("0.30.0"):
 
@@ -140,7 +141,6 @@ class AscendBlockTables(BlockTables):
                 dtype=torch.int32,
                 device=self.device,
             )
-
 
     def configure_circular(self, circular: list[bool]) -> None:
         """Configure fixed-ring addressing after cache initialization, before capture."""

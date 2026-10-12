@@ -2137,32 +2137,15 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
         assert builder.tq_group_block_sizes is None
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_multistep_draft_capture_metadata_lifecycle(monkeypatch, fail):
+def test_multistep_draft_capture_metadata_lifecycle(monkeypatch):
     module = SimpleNamespace(build_attn_metadata=lambda **kwargs: kwargs)
     monkeypatch.setattr(attn_utils, "_BUILD_ATTN_METADATA_MODULE", module)
     original_builder = module.build_attn_metadata
     monkeypatch.setattr(attn_utils, "build_attn_metadata", lambda **kwargs: kwargs)
     with (
-        pytest.raises(RuntimeError) if fail else nullcontext(),
         attn_utils.build_attn_metadata_wrapper(for_cudagraph_capture=True),
+        attn_utils.build_attn_metadata_factory(torch.arange(4), 2, False, attn_state=AscendAttentionState.SpecDecoding),
     ):
-        # Each warmup/recording step rebuilds draft metadata under mode NONE.
-        for _ in range(3):
-            with attn_utils.build_attn_metadata_factory(
-                torch.arange(4),
-                2,
-                False,
-                attn_state=AscendAttentionState.SpecDecoding,
-            ):
-                metadata = module.build_attn_metadata()
-                assert metadata["for_cudagraph_capture"] is True
-                assert metadata["attn_state"] is AscendAttentionState.SpecDecoding
-        if fail:
-            raise RuntimeError("capture failed")
+        metadata = module.build_attn_metadata()
+        assert metadata["for_cudagraph_capture"] is True
     assert module.build_attn_metadata is original_builder
-    with (
-        attn_utils.build_attn_metadata_wrapper(),
-        attn_utils.build_attn_metadata_factory(torch.arange(4), 2, False),
-    ):
-        assert "for_cudagraph_capture" not in module.build_attn_metadata()

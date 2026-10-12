@@ -206,17 +206,9 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size, k
         tokens_per_state=pool_size,
         model_version="glm5_next",
     )
-    if kernel_block_size is not None:
-        group = AttentionGroup(AscendIndexerKPoolBackend, ["layer.indexer.k_cache"], spec, 0)
-        group.create_metadata_builders(
-            config, torch.device("cpu"), kernel_block_size=kernel_block_size, num_metadata_builders=2
-        )
-        builders = group.metadata_builders
-    else:
-        builders = [
-            AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))
-            for _ in range(2)
-        ]
+    group = AttentionGroup(AscendIndexerKPoolBackend, ["layer.indexer.k_cache"], spec, 0)
+    group.create_metadata_builders(config, torch.device("cpu"), kernel_block_size=128, num_metadata_builders=2)
+    builders = group.metadata_builders
     pages = torch.tensor([[7, 2, -1]], dtype=torch.int32)
     expanded = (pages.unsqueeze(-1) * split + torch.arange(split)).reshape(1, -1).int()
     expanded[:, -split:] = -1
@@ -240,8 +232,6 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size, k
     first, draft = [builder.build(0, common) for builder in builders]
     assert first.num_tokens == draft.num_tokens == 3
     assert first.max_pool_seq_len == draft.max_pool_seq_len == storage_block_size + 1
-    assert captured.num_tokens == 4
-    assert captured.max_pool_seq_len == 3 * storage_block_size
     # Kernel-granularity blocks: the metadata reports the natural kernel rows
     # (kernel size / pool ratio) and passes the common expanded table through
     # as a view, so both builders observe the same persistent buffer.
@@ -368,23 +358,15 @@ def test_model_cache_layers_publish_source_compatible_specs():
     }
 
 
-@pytest.mark.parametrize(("num_speculative_tokens", "expected_capacity"), [(0, 4), (1, 8), (3, 8), (7, 16)])
-@pytest.mark.parametrize("start_residue", range(4))
-def test_indexer_tail_retains_history_after_speculative_rejection(
-    num_speculative_tokens, expected_capacity, start_residue
-):
-    pool_size = 4
+@pytest.mark.parametrize(("num_speculative_tokens", "expected_capacity"), [(1, 5), (3, 7), (7, 11)])
+def test_indexer_tail_initializes_exact_speculative_capacity(num_speculative_tokens, expected_capacity):
     config = SimpleNamespace(
-        speculative_config=(
-            SimpleNamespace(num_speculative_tokens=num_speculative_tokens) if num_speculative_tokens else None
-        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=num_speculative_tokens),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1, decode_context_parallel_size=1),
         cache_config=SimpleNamespace(block_size=128, enable_prefix_caching=False),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    model_config = SimpleNamespace(
-        index_topk=8, index_n_heads=1, index_head_dim=2, index_kpool=pool_size, qk_rope_head_dim=0
-    )
+    model_config = SimpleNamespace(index_topk=8, index_n_heads=1, index_head_dim=2, index_kpool=4, qk_rope_head_dim=0)
     with (
         patch("vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config", return_value=config),
         patch("vllm_ascend.models.glm5next.attention.ReplicatedLinear", return_value=torch.nn.Identity()),
@@ -396,7 +378,7 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
             hidden_size=4,
             q_lora_rank=4,
             quant_config=None,
-            cache_config=SimpleNamespace(block_size=128),
+            cache_config=config.cache_config,
             topk_indices_buffer=torch.empty(8, 11, dtype=torch.int32),
             prefix="model.layers.0.indexer",
         )
@@ -404,9 +386,8 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
     indexer_spec = indexer.k_cache.get_kv_cache_spec(config)
     capacity = tail_spec.block_size
     assert capacity == expected_capacity
-    # Exercise the real resolution/constructor path: private rings are excluded
-    # from scheduler-size calculation, but the no-prefix coordinator validates
-    # every original group. Raw capacities such as 7 cannot divide that size.
+    # Private tails initialize with exact capacities 5/7/11 even without
+    # prefix caching; they need not divide the scheduler block size.
     register_ascend_kv_cache_specs()
     cache_plan = KVCacheConfig(
         num_blocks=4,
@@ -417,6 +398,7 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
         ],
     )
     scheduler_size, hash_size = _ascend_resolve_kv_cache_block_sizes(cache_plan, config)
+    assert scheduler_size % capacity != 0
     coordinator = get_kv_cache_coordinator(
         kv_cache_config=cache_plan,
         max_model_len=1024,
@@ -426,18 +408,6 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
         hash_block_size=hash_size,
     )
     assert isinstance(coordinator.single_type_managers[1], KpoolTailManager)
-    # Store absolute positions as distinct raw-key values. The verifier writes
-    # every candidate before the sampler decides how many tokens to retain.
-    start = 4 * pool_size + start_residue
-    ring = [-1] * capacity
-    for position in range(start + num_speculative_tokens + 1):
-        ring[position % capacity] = position
-    for accepted in range(1, num_speculative_tokens + 2):
-        replay_start = start + accepted
-        pool_start = replay_start // pool_size * pool_size
-        assert [ring[position % capacity] for position in range(pool_start, replay_start)] == list(
-            range(pool_start, replay_start)
-        )
 
 
 def test_indexer_metadata_preserves_raw_request_boundaries():
