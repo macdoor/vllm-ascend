@@ -368,7 +368,7 @@ def test_model_cache_layers_publish_source_compatible_specs():
     }
 
 
-@pytest.mark.parametrize(("num_speculative_tokens", "expected_capacity"), [(0, 4), (1, 8), (3, 8), (7, 16)])
+@pytest.mark.parametrize(("num_speculative_tokens", "expected_capacity"), [(0, 4), (1, 5), (3, 7), (7, 11)])
 @pytest.mark.parametrize("start_residue", range(4))
 def test_indexer_tail_retains_history_after_speculative_rejection(
     num_speculative_tokens, expected_capacity, start_residue
@@ -403,10 +403,10 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
     tail_spec = indexer.tail_cache.get_kv_cache_spec(config)
     indexer_spec = indexer.k_cache.get_kv_cache_spec(config)
     capacity = tail_spec.block_size
-    assert capacity == expected_capacity
-    # Exercise the real resolution/constructor path: private rings are excluded
-    # from scheduler-size calculation, but the no-prefix coordinator validates
-    # every original group. Raw capacities such as 7 cannot divide that size.
+    assert capacity == expected_capacity == pool_size + num_speculative_tokens
+    # Exercise unrounded capacities through the actual initialization path.
+    # Private-tail geometry is independent of scheduler blocks even without
+    # prefix caching; capacities 5, 7 and 11 need not divide that block size.
     register_ascend_kv_cache_specs()
     cache_plan = KVCacheConfig(
         num_blocks=4,
@@ -417,6 +417,8 @@ def test_indexer_tail_retains_history_after_speculative_rejection(
         ],
     )
     scheduler_size, hash_size = _ascend_resolve_kv_cache_block_sizes(cache_plan, config)
+    if num_speculative_tokens:
+        assert scheduler_size % capacity != 0
     coordinator = get_kv_cache_coordinator(
         kv_cache_config=cache_plan,
         max_model_len=1024,
