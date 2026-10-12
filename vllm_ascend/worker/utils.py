@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -6,10 +6,56 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+
+
+def build_kv_cache_copy_views(
+    kv_cache_config: KVCacheConfig,
+    get_layer_cache: Callable[[str], torch.Tensor | Sequence[torch.Tensor]],
+    runner_caches: Iterable[torch.Tensor | Sequence[torch.Tensor]],
+) -> list[torch.Tensor]:
+    """Expose complete shared pages to COW without changing layer bindings.
+
+    Layers can alias physical pages. Copy each shared page only once,
+    preserving the logical views bound to layers.
+    """
+    copy_caches: list[torch.Tensor] = []
+    shared_page_ranges: list[tuple[torch.device, int, int]] = []
+    for descriptor in kv_cache_config.kv_cache_tensors:
+        if len(descriptor.layers) < 2 or descriptor.layer_stride != 0:
+            continue
+        caches = [get_layer_cache(name) for name in descriptor.layers]
+        first_components = [cache if isinstance(cache, torch.Tensor) else cache[0] for cache in caches]
+        first = first_components[0]
+        # Packed regions start at different addresses and retain their own
+        # block strides. Only views with the same page origin alias pages.
+        if any(tensor.data_ptr() != first.data_ptr() for tensor in first_components[1:]):
+            continue
+        storage = first.untyped_storage()
+        base = first.storage_offset() * first.element_size()
+        assert base + descriptor.size <= storage.nbytes()
+        pages = torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+            storage, base, (kv_cache_config.num_blocks, descriptor.block_stride)
+        )
+        copy_caches.append(pages)
+        shared_page_ranges.append((pages.device, pages.data_ptr(), pages.data_ptr() + pages.numel()))
+
+    for cache in runner_caches:
+        for tensor in (cache,) if isinstance(cache, torch.Tensor) else cache:
+            if tensor.numel() == 0:
+                continue
+            # Layer bindings and runner tensors can be distinct objects over
+            # the same pages. Keep unrelated regions in a shared storage.
+            if any(
+                tensor.device == device and start <= tensor.data_ptr() < end
+                for device, start, end in shared_page_ranges
+            ):
+                continue
+            copy_caches.append(tensor)
+    return copy_caches
 
 
 def copy_kv_cache_blocks_inplace(
