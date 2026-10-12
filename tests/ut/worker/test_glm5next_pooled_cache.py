@@ -31,9 +31,9 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_kv_cache_groups,
     get_glm5_next_pool_bytes_per_block,
 )
-from vllm_ascend.models.glm5next.cache_views import build_kv_cache_copy_views
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.utils import build_kv_cache_copy_views
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
@@ -666,13 +666,24 @@ def test_mrv2_block_stride_capability_preserves_generic_backing(monkeypatch, pag
     assert torch.count_nonzero(raw["attention.1"]) == 0
 
 
-@pytest.mark.parametrize("geometry", [{"offset": 1}, {"layer_stride": 64}, {"block_stride": 32}, {"size": 1}])
+@pytest.mark.parametrize("geometry", ["offset", "layer_stride", "block_stride", "size"])
 def test_mrv2_rejects_invalid_shared_slot_geometry(monkeypatch, geometry):
     config, _, plan = _make_plan()
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
-    plan.kv_cache_tensors[0] = replace(plan.kv_cache_tensors[0], **geometry)
-    with pytest.raises(ValueError, match="shared-slot"):
+    descriptor = plan.kv_cache_tensors[-1]
+    if geometry == "layer_stride":
+        # A valid packed descriptor cannot be mixed with independent slots.
+        descriptor = replace(descriptor, layer_stride=descriptor.size, size=descriptor.size * len(descriptor.layers))
+    else:
+        descriptor = replace(descriptor, **{geometry: 1})
+    plan.kv_cache_tensors[-1] = descriptor
+    # A bad later descriptor must fail before allocating earlier valid slots.
+    with (
+        patch.object(attn_utils, "_allocate_int8_cache_tensor") as allocate,
+        pytest.raises(ValueError, match="shared-slot"),
+    ):
         attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
+    allocate.assert_not_called()
 
 
 def test_padded_page_layout_rejected_without_tail_caches():

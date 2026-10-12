@@ -934,8 +934,8 @@ def _allocate_kv_cache(
     layer_group_ids = {
         name: group_id for group_id, group in enumerate(kv_cache_config.kv_cache_groups) for name in group.layer_names
     }
-    # Cross-group layers in one descriptor share a physical slot. Other
-    # descriptors describe per-layer regions within a common backing.
+    # Cross-group aliases select an unpacked-slot plan outside the specialized
+    # allocators. Validate every descriptor below before allocating its slots.
     uses_shared_slots = any(
         len({layer_group_ids[name] for name in get_kv_cache_tensor_layers(descriptor)}) > 1
         for descriptor in kv_cache_config.kv_cache_tensors
@@ -982,6 +982,24 @@ def _allocate_kv_cache(
         )
         for layer_name, start, layer_size in dsv4_regions:
             kv_cache_raw_tensors[layer_name] = dsv4_backing[start : start + layer_size]
+    elif uses_shared_slots:
+        # Every descriptor owns an independent zero-offset slot, including
+        # single-layer descriptors. Page sizes may differ between slots, but
+        # mixing slots with packed views into a common backing is unsupported.
+        # Check the entire plan before allocating even the first slot.
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            names = get_kv_cache_tensor_layers(descriptor)
+            if (
+                descriptor.offset != 0
+                or descriptor.layer_stride != 0
+                or descriptor.block_stride <= 0
+                or descriptor.size != kv_cache_config.num_blocks * descriptor.block_stride
+                or any(layer_kv_cache_spec[name].page_size_bytes != descriptor.block_stride for name in names)
+            ):
+                raise ValueError(
+                    f"Invalid shared-slot KV cache descriptor geometry for {names}: all descriptors must have "
+                    "zero offset/layer stride and num_blocks complete pages matching each layer's page size."
+                )
 
     # vLLM #51718 changed every KVCacheTensor to describe a view into one
     # common backing allocation. Hybrid groups overlay that backing from byte
@@ -1042,17 +1060,6 @@ def _allocate_kv_cache(
         ):
             # Each descriptor owns one slot; its layers alias the same pages
             # at different scheduler block IDs (also for standalone MTP).
-            if uses_shared_slots and (
-                kv_cache_tensor.offset != 0
-                or kv_cache_tensor.layer_stride != 0
-                or kv_cache_tensor.block_stride <= 0
-                or kv_cache_tensor.size != kv_cache_config.num_blocks * kv_cache_tensor.block_stride
-                or any(
-                    layer_kv_cache_spec[name].page_size_bytes != kv_cache_tensor.block_stride for name in shared_names
-                )
-            ):
-                raise ValueError("Invalid shared-slot KV cache descriptor geometry.")
-
             raw_tensor = _allocate_int8_cache_tensor(kv_cache_tensor.size, alignment, device)
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
