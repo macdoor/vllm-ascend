@@ -8,7 +8,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import (

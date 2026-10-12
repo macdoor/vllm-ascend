@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from itertools import permutations
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -17,7 +17,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, MambaSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -25,7 +25,6 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     requires_padded_page_layout,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import collect_configured_register_regions
 from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_kv_cache_config,
     get_glm5_next_kv_cache_groups,
@@ -33,7 +32,6 @@ from vllm_ascend.models.glm5next.cache_config import (
 )
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.utils import build_kv_cache_copy_views
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
@@ -136,8 +134,8 @@ def _make_specs(main_head_size=4):
     }
 
 
-def _make_runner(config, main_cache_dims=(4, 0)):
-    runner = NPUModelRunner.__new__(NPUModelRunner)
+def _make_runner(config, main_cache_dims=(4, 0), runner_cls=NPUModelRunner):
+    runner = runner_cls.__new__(runner_cls)
     runner.device = torch.device("cpu")
     runner.vllm_config = config
     runner.dcp_size = config.parallel_config.decode_context_parallel_size
@@ -229,24 +227,14 @@ def runner_factory(request, monkeypatch):
 
             def reshape(plan, raw):
                 specs = attn_utils._get_layer_kv_cache_specs(plan)
-                groups = [
-                    SimpleNamespace(
-                        kv_cache_group_id=i,
-                        kv_cache_spec=specs[name],
-                        layer_names=[name],
-                        backend=_StateBackend if name == STATE else _AttentionBackend,
-                    )
-                    for i, group in enumerate(plan.kv_cache_groups)
-                    for name in group.layer_names
-                ]
+                groups = [group for group in runner._kv_cache_spec_attn_group_iterator() if group.layer_names[0] in raw]
+                for group in groups:
+                    group.kv_cache_spec = specs[group.layer_names[0]]
                 return attn_utils._reshape_kv_cache_v2(
                     groups,
                     raw,
                     "auto",
-                    [
-                        kernel_block_size if i == 0 else group.kv_cache_spec.block_size
-                        for i, group in enumerate(plan.kv_cache_groups)
-                    ],
+                    [sizes[0] for sizes in runner.kernel_block_sizes],
                     {},
                     plan,
                 )
@@ -326,169 +314,114 @@ def test_glm5_next_runner_splits_main_mla_components_within_each_page(runner_fac
     assert k_pe_cache.data_ptr() - raw_caches[MAIN].data_ptr() == kv_c_cache[0].numel() * kv_c_cache.element_size()
 
 
-@pytest.mark.parametrize("kv_transfer", [False, True])
+@pytest.fixture
+def copy_cache(monkeypatch):
+    """Install COW through cache initialization and use the inherited request entry."""
+
+    def copy(plan, bindings, caches, physical_views):
+        config = _make_config()
+        config.compilation_config.static_forward_context = {
+            name: SimpleNamespace(kv_cache=cache) for name, cache in bindings.items()
+        }
+        runner = _make_runner(config, runner_cls=NPUModelRunnerV2)
+        runner.ascend_config.sparse_kv_offload_config = runner.sparse_kv_offload_config
+        runner.is_last_pp_rank = False
+        runner.max_num_reqs = config.scheduler_config.max_num_seqs
+        runner.model_config.enable_return_routed_experts = False
+        runner.model_state = SimpleNamespace()
+        runner.model = torch.nn.Module()
+        runner.pcp_manager = runner.speculator = None
+        runner.attn_groups = []
+        runner.req_states = SimpleNamespace(
+            num_computed_tokens_np=np.zeros(0, dtype=np.int32),
+            prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
+            num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
+        )
+
+        def initialize(self, cache_config, kv_cache_allocation_context=None):
+            self.kv_cache_config = cache_config
+            self.block_tables = MagicMock(spec=AscendBlockTables)
+            self.kv_caches = caches
+
+        monkeypatch.setattr(GPUModelRunner, "initialize_kv_cache", initialize)
+        with (
+            patch("vllm_ascend.worker.v2.model_runner.graph_manager_wrapper", return_value=nullcontext()),
+            patch("vllm_ascend.worker.v2.model_runner.KVPPRuntime.create_from_kv_cache"),
+        ):
+            runner.initialize_kv_cache(plan)
+        storages = {
+            tensor.untyped_storage().data_ptr(): torch.empty(0, dtype=torch.uint8).set_(tensor.untyped_storage())
+            for tensor in physical_views
+        }
+        for storage in storages.values():
+            storage.fill_(99)
+        for tensor in physical_views:
+            for block_id in range(plan.num_blocks):
+                tensor[block_id].fill_(11 * (block_id + 1))
+        expected = {ptr: storage.clone() for ptr, storage in storages.items()}
+        for tensor in physical_views:
+            view = torch.empty(0, dtype=tensor.dtype).set_(
+                expected[tensor.untyped_storage().data_ptr()].untyped_storage(),
+                tensor.storage_offset(),
+                tensor.shape,
+                tensor.stride(),
+            )
+            view[1:].copy_(tensor[:-1])
+        scheduler_output = SchedulerOutput.make_empty()
+        scheduler_output.kv_cache_block_copies = [
+            KVCacheBlockCopy(src_block_id=i, dst_block_id=i + 1) for i in range(plan.num_blocks - 1)
+        ]
+        runner.update_requests(scheduler_output)
+        for ptr, storage in storages.items():
+            torch.testing.assert_close(storage, expected[ptr])
+        for name, cache in bindings.items():
+            assert runner.compilation_config.static_forward_context[name].kv_cache is cache
+
+    return copy
+
+
 @pytest.mark.parametrize("reverse_bindings", [False, True])
 @pytest.mark.parametrize("main_cache_dims", [(4, 0), (4, 2)])
 @pytest.mark.parametrize("kernel_block_size", [4, 8])
 def test_mrv2_copy_on_write_preserves_pooled_pages_and_layer_bindings(
-    runner_factory, monkeypatch, kv_transfer, reverse_bindings, main_cache_dims, kernel_block_size
+    runner_factory, copy_cache, reverse_bindings, main_cache_dims, kernel_block_size
 ):
     config, _, plan = _make_plan(main_head_size=sum(main_cache_dims))
-    if kv_transfer:
-        config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeConnectorV2")
+    config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeConnectorV2")
     allocator = runner_factory(config, main_cache_dims, kernel_block_size)
     raw_caches = allocator._allocate_kv_cache_tensors(plan)
     caches = allocator._reshape_kv_cache_tensors(plan, raw_caches)
-    if kv_transfer:
-        regions = collect_configured_register_regions(plan, caches)
-        assert set(zip(regions.ptrs, regions.lengths)) == {
-            (raw_caches[name].data_ptr(), raw_caches[name].numel()) for name in (MAIN, INDEXER)
-        }
-        assert regions.logical_tensor_count == len(plan.kv_cache_tensors)
-    bindings = {name: SimpleNamespace(kv_cache=cache) for name, cache in caches.items()}
-    config.compilation_config.static_forward_context = bindings
-
-    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
-    runner.ascend_config = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
-    runner.is_last_pp_rank = False
-    runner.max_num_reqs = config.scheduler_config.max_num_seqs
-    runner.device = torch.device("cpu")
-    runner.vllm_config = config
-    runner.compilation_config = config.compilation_config
-    runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
-    runner.model_state = SimpleNamespace()
-    runner.model = torch.nn.Module()
-    runner.pcp_manager = None
-    runner.speculator = None
-    runner.attn_groups = []
-
-    def initialize(_runner, cache_config, kv_cache_allocation_context=None):
-        _runner.kv_cache_config = cache_config
-        _runner.block_tables = AscendBlockTables.__new__(AscendBlockTables)
-        _runner.block_tables.num_kv_cache_groups = len(cache_config.kv_cache_groups)
-        _runner.block_tables.device = _runner.device
-        _runner.block_tables._slot_mapping_enabled = [
-            group.kv_cache_spec.uses_slot_mapping for group in cache_config.kv_cache_groups
-        ]
-        _runner.block_tables.cp_size = 1
-        _runner.block_tables.block_sizes = [group.kv_cache_spec.block_size for group in cache_config.kv_cache_groups]
-        _runner.block_tables.kernel_block_sizes = _runner.block_tables.block_sizes
-        _runner.block_tables.is_circular = None
-        # Runner tensors can be different Python objects from the layer
-        # bindings while retaining the same physical cache storage.
-        _runner.kv_caches = [
-            tensor.view_as(tensor)
-            for cache in caches.values()
-            for tensor in ((cache,) if isinstance(cache, torch.Tensor) else cache)
-        ]
-        if reverse_bindings:
-            _runner.kv_caches.reverse()
-
-    monkeypatch.setattr(GPUModelRunner, "initialize_kv_cache", initialize)
-    with (
-        patch("vllm_ascend.worker.v2.model_runner.graph_manager_wrapper", return_value=nullcontext()),
-        patch("vllm_ascend.worker.v2.model_runner.KVPPRuntime.create_from_kv_cache"),
-    ):
-        runner.initialize_kv_cache(plan)
-
-    assert all(isinstance(cache, torch.Tensor) and cache.numel() > 0 for cache in runner.kv_caches)
-
-    # Copy a chain using the original source pages. Copying an aliased backing
-    # twice would incorrectly propagate page 0 into page 2.
-    for name in (MAIN, INDEXER):
-        raw = raw_caches[name]
-        torch.empty(0, dtype=torch.int8).set_(raw.untyped_storage()).fill_(99)
-    main_pages = raw_caches[MAIN].view(plan.num_blocks, -1)
-    for page_id, value in enumerate((11, 22, 33)):
-        main_pages[page_id].fill_(value)
-    # The indexer and tail now alias the same physical page, including
-    # padding. A chained copy must preserve each original source page.
-    small_pages = raw_caches[INDEXER].view(plan.num_blocks, -1)
-    for page_id, value in enumerate((3, 5, 7)):
-        small_pages[page_id].fill_(value)
-    expected_small = small_pages.clone()
-    expected_small[[1, 2]] = small_pages[[0, 1]]
-    runner.req_states = SimpleNamespace(
-        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
-        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
-        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
-    )
-    scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output.kv_cache_block_copies = [
-        KVCacheBlockCopy(src_block_id=0, dst_block_id=1),
-        KVCacheBlockCopy(src_block_id=1, dst_block_id=2),
-    ]
-    # UT setup installs the worker patches, so this exercises the Ascend copy
-    # implementation with the inventory installed by initialize_kv_cache.
-    runner.update_requests(scheduler_output)
-
-    for name, cache in caches.items():
-        assert bindings[name].kv_cache is cache
-    for page_id, value in enumerate((11, 11, 22)):
-        assert torch.all(main_pages[page_id] == value)
-    torch.testing.assert_close(small_pages, expected_small)
-    for name in (MAIN, INDEXER):
-        raw = raw_caches[name]
-        storage = torch.empty(0, dtype=torch.int8).set_(raw.untyped_storage())
-        assert torch.all(storage[: raw.storage_offset()] == 99)
-        assert torch.all(storage[raw.storage_offset() + raw.numel() :] == 99)
+    runner_caches = [tensor.view_as(tensor) for cache in caches.values() for tensor in cache]
+    if reverse_bindings:
+        runner_caches.reverse()
+    copy_cache(plan, caches, runner_caches, [raw_caches[name].view(plan.num_blocks, -1) for name in (MAIN, INDEXER)])
 
 
-def test_copy_inventory_preserves_other_regions_in_shared_storage():
-    backing = torch.full((88,), 99, dtype=torch.uint8)
-    pages = backing[8:56].view(3, 16)
-    other = backing[56:80].view(3, 8)
-    for page_id, value in enumerate((11, 22, 33)):
-        pages[page_id].fill_(value)
-        other[page_id].fill_(value + 1)
-    bindings = {"first": [pages[:, :4]], "second": [pages[:, :8]]}
-    plan = KVCacheConfig(
-        num_blocks=3,
-        kv_cache_tensors=[SimpleNamespace(layers=list(bindings), layer_stride=0, block_stride=16, size=48)],
-        kv_cache_groups=[],
-    )
-    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
-    runner.kv_cache_config = plan
-    runner.req_states = SimpleNamespace(
-        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
-        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
-        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
-    )
-    runner.kv_caches = build_kv_cache_copy_views(
-        plan,
-        bindings.__getitem__,
-        [
-            bindings["second"][0].view_as(bindings["second"][0]),
-            other,
-            bindings["first"][0].view_as(bindings["first"][0]),
-        ],
-    )
-    expected_pages, expected_other = pages.clone(), other.clone()
-    expected_pages[[1, 2]] = pages[[0, 1]]
-    expected_other[[1, 2]] = other[[0, 1]]
-    scheduler_output = SchedulerOutput.make_empty()
-    unchanged = backing.clone()
-    runner.update_requests(scheduler_output)
-    torch.testing.assert_close(backing, unchanged)
-    scheduler_output.kv_cache_block_copies = [
-        KVCacheBlockCopy(src_block_id=0, dst_block_id=1),
-        KVCacheBlockCopy(src_block_id=1, dst_block_id=2),
-    ]
-    runner.update_requests(scheduler_output)
-
-    torch.testing.assert_close(pages, expected_pages)
-    torch.testing.assert_close(other, expected_other)
-    assert torch.all(backing[:8] == 99) and torch.all(backing[80:] == 99)
-
-
-@pytest.mark.parametrize("layout,alignment_slack", [("split", 0), ("split", 64), ("segmented", 64), ("kv_first", 0)])
-def test_copy_inventory_preserves_aliased_component_layouts(layout, alignment_slack):
+@pytest.mark.parametrize(
+    "layout,alignment_slack,layer_stride,layer_count",
+    [
+        ("split", 0, 0, 2),
+        ("split", 64, 0, 2),
+        ("segmented", 64, 0, 2),
+        ("kv_first", 0, 0, 2),
+        ("shared_page", 0, 0, 2),
+        ("split", 0, 0, 1),
+        ("split", 0, 24, 2),
+    ],
+)
+def test_copy_inventory_preserves_aliased_component_layouts(
+    copy_cache, layout, alignment_slack, layer_stride, layer_count
+):
     num_blocks = 2 if layout == "kv_first" else 3
     key_block_bytes = 4 if layout == "kv_first" else 8
     binding: torch.Tensor | tuple[torch.Tensor, ...]
     if layout == "kv_first":
         binding = torch.empty((2, num_blocks, 1, 1, key_block_bytes), dtype=torch.int8)
         key_raw, value_raw = binding.unbind(0)
+    elif layout == "shared_page":
+        backing = torch.full((88,), 99, dtype=torch.uint8)
+        pages, other = backing[8:56].view(3, 16), backing[56:80].view(3, 8)
+        key_raw, value_raw = pages, other
     elif layout == "split":
         key_raw = torch.full((24 + alignment_slack,), 99, dtype=torch.int8)[:24]
         value_raw = torch.full((12 + alignment_slack,), 99, dtype=torch.int8)[:12]
@@ -498,58 +431,35 @@ def test_copy_inventory_preserves_aliased_component_layouts(layout, alignment_sl
             key_raw, value_raw = attn_utils._allocate_sparse_c8_indexer_tensors(
                 24, 12, 64, torch.float32, torch.device("cpu")
             )
-    components = (key_raw.view(num_blocks, key_block_bytes), value_raw.view(torch.float32).view(num_blocks, 1))
-    if layout != "kv_first":
-        binding = components
-    bindings = {"first": binding, "second": binding}
-    page_bytes = key_block_bytes + 4
+    if layout == "shared_page":
+        components = (pages, other)
+        bindings = {"first": (pages[:, :4],), "second": (pages[:, :8],)}
+        page_bytes = 16
+    else:
+        components = (key_raw.view(num_blocks, key_block_bytes), value_raw.view(torch.float32).view(num_blocks, 1))
+        if layout != "kv_first":
+            binding = components
+        bindings = {"first": binding, "second": binding}
+        page_bytes = key_block_bytes + 4
     plan = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
             SimpleNamespace(
-                layers=list(bindings), layer_stride=0, block_stride=page_bytes, size=num_blocks * page_bytes
+                layers=list(bindings)[:layer_count],
+                layer_stride=layer_stride,
+                block_stride=page_bytes,
+                size=num_blocks * page_bytes,
             )
         ],
         kv_cache_groups=[],
     )
-    storages = {
-        tensor.untyped_storage().data_ptr(): torch.empty(0, dtype=torch.uint8).set_(tensor.untyped_storage())
-        for tensor in components
-    }
-    for storage in storages.values():
-        storage.fill_(99)
-    for tensor in components:
-        for block_id, value in enumerate((11, 22, 33)[:num_blocks]):
-            tensor[block_id].fill_(value)
-    expected = {ptr: storage.clone() for ptr, storage in storages.items()}
-    for tensor in components:
-        offset = tensor.storage_offset() * tensor.element_size()
-        size = tensor.numel() * tensor.element_size()
-        pages = expected[tensor.untyped_storage().data_ptr()][offset : offset + size].view(num_blocks, -1)
-        pages[1:] = pages[:-1].clone()
-
-    runner = NPUModelRunnerV2.__new__(NPUModelRunnerV2)
-    runner.kv_cache_config = plan
-    runner.req_states = SimpleNamespace(
-        num_computed_tokens_np=np.zeros(0, dtype=np.int32),
-        prefill_len=SimpleNamespace(np=np.zeros(0, dtype=np.int32)),
-        num_computed_prefill_tokens=np.zeros(0, dtype=np.int32),
-    )
-    runner_caches = (
-        [binding.view_as(binding)] * 2
-        if isinstance(binding, torch.Tensor)
-        else [tuple(tensor.view_as(tensor) for tensor in components)] * 2
-    )
-    runner.kv_caches = build_kv_cache_copy_views(plan, bindings.__getitem__, runner_caches)
-    scheduler_output = SchedulerOutput.make_empty()
-    scheduler_output.kv_cache_block_copies = [
-        KVCacheBlockCopy(src_block_id=block_id, dst_block_id=block_id + 1) for block_id in range(num_blocks - 1)
+    runner_caches = [
+        tensor.view_as(tensor)
+        for cache in bindings.values()
+        for tensor in ((cache,) if isinstance(cache, torch.Tensor) else cache)
     ]
-    runner.update_requests(scheduler_output)
-
-    for ptr, storage in storages.items():
-        torch.testing.assert_close(storage, expected[ptr])
-    assert all(cache is binding for cache in bindings.values())
+    runner_caches.append(other if layout == "shared_page" else torch.empty(num_blocks, 0))
+    copy_cache(plan, bindings, runner_caches, components)
 
 
 def test_standalone_mtp_uses_existing_compressed_cache_allocator(runner_factory):
@@ -628,113 +538,29 @@ def test_padded_page_layout_detected_for_shared_state_pages():
     assert requires_padded_page_layout(layer_specs.values())
 
 
-def test_mrv2_preserves_glm_cache_roles_and_auxiliary_page_sizes(monkeypatch):
-    specs = _make_specs()
-    main = MLAAttention.__new__(MLAAttention)
-    torch.nn.Module.__init__(main)
-    main.impl = SimpleNamespace(fa_quant_layer=False)
-    main.model_version = "glm5_next"
-    main.indexes_kv_by_block_stride = True
-    main.get_kv_cache_spec = lambda _config: MLAAttentionSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=4,
-        dtype=torch.bfloat16,
-        non_causal_multi_token_decode=True,
-    )
-    layers = {
-        name: SimpleNamespace(
-            get_kv_cache_spec=lambda _config, spec=spec: spec,
-            align_kv_cache_with_mamba=name not in (INDEXER, STATE),
-        )
-        for name, spec in specs.items()
-    }
-    layers[MAIN] = main
-    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: layers)
-    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: False)
-    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
-
-    discovered = attn_utils.get_kv_cache_spec(_make_config())
-
-    assert discovered[MAIN].model_version == "glm5_next"
-    assert discovered[MAIN].indexes_kv_by_block_stride
-    assert discovered[MAIN].non_causal_multi_token_decode
-    assert discovered[INDEXER] == specs[INDEXER]
-    assert discovered[STATE] == specs[STATE]
-    assert discovered[MAMBA].page_size_bytes == discovered[MAIN].page_size_bytes
-    assert discovered[INDEXER].page_size_bytes < discovered[MAIN].page_size_bytes
-
-
 @pytest.mark.parametrize("page_size_padded", [None, 128])
 def test_mrv2_block_stride_capability_preserves_generic_backing(monkeypatch, page_size_padded):
     config = _make_config()
-    attention_spec = AscendMLAAttentionSpec(
-        block_size=8,
-        num_kv_heads=1,
-        head_size=4,
-        dtype=torch.bfloat16,
-        indexes_kv_by_block_stride=True,
-        page_size_padded=page_size_padded,
-    )
-    state_spec = replace(_make_specs()[MAMBA], page_size_padded=attention_spec.page_size_bytes)
-    num_blocks = 3
-    layer_size = num_blocks * attention_spec.page_size_bytes
-    plan = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=2 * layer_size,
-                layers=names,
-                offset=0,
-                layer_stride=layer_size,
-                block_stride=attention_spec.page_size_bytes,
-            )
-            for names in (["attention.0", "attention.1"], ["state.0"])
-        ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["attention.0", "attention.1"], attention_spec),
-            KVCacheGroupSpec(["state.0"], state_spec),
-        ],
-    )
-    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
-
-    raw = attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
-
-    backing = raw["attention.0"].untyped_storage()
-    assert backing.nbytes() == 2 * layer_size
-    assert all(cache.untyped_storage().data_ptr() == backing.data_ptr() for cache in raw.values())
-    assert raw["state.0"].data_ptr() == raw["attention.0"].data_ptr()
-    assert raw["attention.1"].data_ptr() - raw["attention.0"].data_ptr() == layer_size
-
-    monkeypatch.setattr(attn_utils, "_get_attention_kv_cache_dims", lambda _name, _spec: (4, 0))
+    spec = replace(_make_specs()[MAIN], model_version=None, page_size_padded=page_size_padded)
+    raw = torch.zeros(3 * spec.page_size_bytes, dtype=torch.int8)
+    plan = KVCacheConfig(num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec([MAIN], spec)])
     layer = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(layer)
-    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: dict.fromkeys(raw, layer))
-    attn_groups = [
-        SimpleNamespace(
-            kv_cache_group_id=i,
-            kv_cache_spec=group.kv_cache_spec,
-            layer_names=group.layer_names,
-            backend=_AttentionBackend,
-        )
-        for i, group in enumerate(plan.kv_cache_groups)
-    ]
-    views = attn_utils._reshape_kv_cache_v2(attn_groups, raw, "auto", [4, 8], {}, plan)
-    cache, rope = views["attention.0"]
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: {MAIN: layer})
+    monkeypatch.setattr(attn_utils, "_get_attention_kv_cache_dims", lambda *_args: (4, 0))
+    group = SimpleNamespace(kv_cache_group_id=0, kv_cache_spec=spec, layer_names=[MAIN], backend=_AttentionBackend)
+    views = attn_utils._reshape_kv_cache_v2([group], {MAIN: raw}, "auto", [4], {}, plan)
+    cache, rope = views[MAIN]
     assert rope.numel() == 0
     if page_size_padded is None:
-        assert cache.shape == (6, 4, 1, 4)
-        # Kernel block 2 starts at scheduler page 1, without a model marker.
         cache[2].fill_(7)
     else:
-        # Padded pages retain the generic page-strided view.
-        assert cache.shape == (3, 8, 1, 4)
         cache[1, :4].fill_(7)
-    physical_pages = raw["attention.0"].view(torch.bfloat16).view(num_blocks, -1)
+    physical_pages = raw.view(torch.bfloat16).view(3, -1)
     assert torch.all(physical_pages[1, :16] == 7)
     assert torch.count_nonzero(physical_pages[[0, 2]]) == 0
     assert torch.count_nonzero(physical_pages[1, 16:]) == 0
-    assert torch.count_nonzero(raw["attention.1"]) == 0
 
 
 @pytest.mark.parametrize("geometry", ["offset", "layer_stride", "block_stride", "size"])

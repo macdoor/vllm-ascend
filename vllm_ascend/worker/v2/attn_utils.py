@@ -78,7 +78,6 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
-    requires_padded_page_layout,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -319,10 +318,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
     if mamba_specs:
         _align_hybrid_attention_page_sizes(kv_cache_spec)
-        common_page_size = max(
-            spec.page_size_bytes
-            for spec in (*[kv_cache_spec[name] for name in attention_layer_names], *mamba_specs.values())
-        )
+        common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
         for layer_name in attention_layer_names:
             spec = kv_cache_spec[layer_name]
             page_size_padded = common_page_size if spec.page_size_bytes < common_page_size else spec.page_size_padded
@@ -682,7 +678,7 @@ def _adjust_dsv4_kv_layout(
             offset_bytes = base_offset_bytes
         dtype_size = get_dtype_size(dtype)
         page_stride = page_size_bytes // dtype_size
-        stride = torch.empty(shape, device="meta").stride()
+        stride = torch.empty(shape).stride()
         if offset_bytes % dtype_size:
             raise ValueError(f"DSA cache offset {offset_bytes} is not aligned to {dtype}.")
         caches.append(
@@ -1390,7 +1386,6 @@ def _reshape_kv_cache_v2(
         if is_dsv4_model and uses_turboquant_groups(kv_cache_config.kv_cache_groups)
         else {}
     )
-    uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
 
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -1548,16 +1543,7 @@ def _reshape_kv_cache_v2(
             if isinstance(kv_cache_spec, MambaSpec):
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError(f"Mamba cache for {layer_name} must use one raw tensor.")
-                if uses_padded_page_layout:
-                    num_blocks = raw_cache.numel() // kv_cache_spec.page_size_bytes
-                    mamba_cache = _adjust_dsv4_kv_layout(
-                        raw_cache,
-                        [(num_blocks, *shape) for shape in kv_cache_spec.shapes],
-                        kv_cache_spec.dtypes,
-                        kv_cache_spec.page_size_bytes,
-                    )
-                else:
-                    mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
+                mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
                 kv_caches[layer_name] = mamba_cache

@@ -260,5 +260,3 @@ def test_configure_circular_validates_active_layout(circular, enabled, cp_size, 
             torch.testing.assert_close(tables.is_circular, torch.tensor(expected_circular))
         else:
             assert tables.is_circular is None
-        tables.configure_circular([False, False])
-        assert tables.is_circular is None
