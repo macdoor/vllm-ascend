@@ -93,11 +93,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
-from vllm_ascend.models.glm5next.cache_views import (
-    view_compressed_indexer_cache,
-    view_glm5_next_cache,
-    view_kpool_tail_cache,
-)
+from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -1679,36 +1675,6 @@ def _reshape_kv_cache_v2(
                     )
                 else:
                     kv_caches[layer_name] = typed_cache.view(kv_cache_shape)
-                continue
-
-            if isinstance(kv_cache_spec, AscendIndexerKPoolTailSpec):
-                kv_caches[layer_name] = view_kpool_tail_cache(
-                    layer_name, kv_cache_spec, raw_cache, kv_cache_config.num_blocks
-                )
-                continue
-            if (
-                isinstance(kv_cache_spec, AscendMLAAttentionSpec)
-                and getattr(kv_cache_spec, "model_version", None) == "glm5_next"
-                and get_kv_cache_compression_ratio(kv_cache_spec) > 1
-            ):
-                kv_caches[layer_name] = view_compressed_indexer_cache(
-                    layer_name,
-                    kv_cache_spec,
-                    raw_cache,
-                    group.backend,
-                    kernel_block_size * get_kv_cache_compression_ratio(kv_cache_spec),
-                )
-                continue
-            if is_dsv4_model and isinstance(kv_cache_spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
-                if not isinstance(raw_cache, torch.Tensor):
-                    raise ValueError(f"DSA cache for {layer_name} must use one raw tensor.")
-                kv_caches[layer_name] = _view_dsv4_cache(
-                    raw_cache,
-                    kv_cache_spec,
-                    group.backend,
-                    kv_cache_config,
-                    dsv4_page_strides.get(layer_name),
-                )
                 continue
 
             if isinstance(kv_cache_spec, MambaSpec):
