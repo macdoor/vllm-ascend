@@ -32,7 +32,10 @@ from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
-from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
+from vllm.distributed.ec_transfer import (
+    ensure_ec_transfer_initialized,
+    ensure_ec_transfer_shutdown,
+)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     ensure_kv_transfer_shutdown,
@@ -370,6 +373,8 @@ class NPUWorker(WorkerBase):
             state.close()
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if ensure_ec_transfer_shutdown is not None:
+            ensure_ec_transfer_shutdown()
 
         if self.profiler is not None:
             self.profiler.shutdown()
@@ -1269,6 +1274,27 @@ class NPUWorker(WorkerBase):
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
+
+    def get_encoder_cudagraph_stats(self) -> dict[str, Any] | None:
+        """Return serializable encoder graph state for diagnostics.
+
+        Utility RPCs use safe serialization by default, so callers must invoke
+        a worker method by name instead of sending a Python callback. Keep the
+        result limited to primitive containers supported by that serializer.
+        """
+        model_state = getattr(self.model_runner, "model_state", None)
+        encoder_runner = getattr(model_state, "encoder_runner", None)
+        manager = getattr(encoder_runner, "cudagraph_manager", None)
+        if manager is None:
+            # Model Runner V1 owns the manager directly.
+            manager = getattr(self.model_runner, "encoder_cudagraph_manager", None)
+        if manager is None:
+            return None
+        return {
+            "manager": type(manager).__name__,
+            "captured": manager.is_captured(),
+            **manager.get_cumulative_stats(),
+        }
 
     # Lockstep wave sync for idle DP ranks (never burns manual_dump);
     # lives in the runtime_guard hook, see runtime_guard_idle_step.
