@@ -378,6 +378,7 @@ def test_indexer_tail_initializes_exact_speculative_capacity(num_speculative_tok
         patch("vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config", return_value=config),
         patch("vllm_ascend.models.glm5next.attention.ReplicatedLinear", return_value=torch.nn.Identity()),
         patch("vllm_ascend.models.glm5next.attention.MergedColumnParallelLinear", return_value=torch.nn.Identity()),
+        patch("vllm_ascend.models.glm5next.attention.LayerNorm", torch.nn.LayerNorm),
     ):
         indexer = Indexer(
             config,

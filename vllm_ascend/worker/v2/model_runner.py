@@ -103,7 +103,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
-from vllm_ascend.worker.utils import build_kv_cache_copy_views, disable_compilation
+from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
@@ -135,7 +135,6 @@ class NPUModelRunner(GPUModelRunner):
 
     execute_model_state: ExecuteModelState | None
     max_num_reqs: int
-    kv_caches: list[torch.Tensor]
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -463,12 +462,6 @@ class NPUModelRunner(GPUModelRunner):
         initialize_kda_state_copy(
             self.vllm_config.compilation_config.static_forward_context,
             self.vllm_config.scheduler_config.max_num_seqs,
-        )
-
-        self.kv_caches = build_kv_cache_copy_views(
-            self.kv_cache_config,
-            lambda name: self.compilation_config.static_forward_context[name].kv_cache,
-            self.kv_caches,
         )
 
         # Only target-model layers determine whether FIA is in use. This flag
