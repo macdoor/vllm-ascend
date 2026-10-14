@@ -94,20 +94,20 @@ def copy_kv_cache_blocks_inplace(
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
-    """Copy logical cache blocks for Ascend's segmented cache layout.
+    """Copy aliased pages and independent block-indexed cache segments.
 
-    Unlike the upstream block-major allocation, an Ascend cache allocation can
-    contain multiple block-indexed tensor segments. For example, Mamba stores
-    all convolution states before all SSM states in the same storage. Treating
-    that complete storage as ``[num_blocks, page_size]`` therefore copies the
-    wrong byte ranges. Copy every tensor segment as ``num_blocks`` complete
-    physical pages instead. A page may span multiple kernel-level cache blocks.
+    Equal origins do not imply equal views. Copy a shared physical page once
+    only when every overlapping component satisfies its block-major layout;
+    otherwise preserve component-wise copying, including segmented storage.
+    A scheduler block may span multiple kernel-level blocks.
     """
     if not kv_cache_block_copies:
         return
 
     cache_tensors: list[torch.Tensor] = []
-    seen_tensors: set[int] = set()
+    seen_tensors: set[tuple[int, torch.dtype, tuple[int, ...], tuple[int, ...]]] = set()
+    aliased_origins: set[int] = set()
+    seen_origins: set[int] = set()
     for entry in kv_caches:
         if entry is None:
             continue
@@ -116,12 +116,16 @@ def copy_kv_cache_blocks_inplace(
         else:
             tensors = entry
         for tensor in tensors:
-            if tensor is None:
+            if tensor is None or not tensor.numel():
                 continue
             data_ptr = tensor.data_ptr()
-            if data_ptr in seen_tensors:
+            geometry = (data_ptr, tensor.dtype, tuple(tensor.shape), tensor.stride())
+            if geometry in seen_tensors:
                 continue
-            seen_tensors.add(data_ptr)
+            seen_tensors.add(geometry)
+            if data_ptr in seen_origins:
+                aliased_origins.add(data_ptr)
+            seen_origins.add(data_ptr)
             cache_tensors.append(tensor)
 
     if not cache_tensors:
@@ -131,6 +135,53 @@ def copy_kv_cache_blocks_inplace(
     for tensor in cache_tensors:
         assert tensor.device == device
         assert tensor.shape[0] % num_blocks == 0
+
+    copy_pages: list[torch.Tensor] = []
+    page_ranges: list[tuple[int, int]] = []
+    for tensor in sorted(cache_tensors, key=torch.Tensor.data_ptr) if aliased_origins else ():
+        start = tensor.data_ptr()
+        if any(begin <= start < end for begin, end in page_ranges):
+            continue
+        blocks = tensor.unflatten(0, (num_blocks, tensor.shape[0] // num_blocks))
+        page_bytes = blocks.stride(0) * tensor.element_size()
+        storage = tensor.untyped_storage()
+        base = tensor.storage_offset() * tensor.element_size()
+        if (
+            page_bytes <= 0
+            or base + num_blocks * page_bytes > storage.nbytes()
+            or not any(start <= origin < start + page_bytes for origin in aliased_origins)
+        ):
+            continue
+        # Aliasing alone does not prove a page layout. All overlapping views
+        # must advance by the same physical page and fit inside its first row.
+        for component in cache_tensors:
+            if component.untyped_storage().data_ptr() != storage.data_ptr():
+                continue
+            offset = component.data_ptr() - start
+            if offset >= num_blocks * page_bytes:
+                continue
+            component_blocks = component.unflatten(0, (num_blocks, component.shape[0] // num_blocks))
+            component_page_bytes = component_blocks.stride(0) * component.element_size()
+            page_end = offset + component.element_size() * (
+                1
+                + sum(
+                    (size - 1) * stride
+                    for size, stride in zip(component_blocks.shape[1:], component_blocks.stride()[1:])
+                )
+            )
+            if page_end + (num_blocks - 1) * component_page_bytes <= 0:
+                continue
+            if offset < 0 or component_page_bytes != page_bytes or page_end > page_bytes:
+                break
+        else:
+            pages = torch.empty(0, dtype=torch.uint8, device=device).set_(storage, base, (num_blocks, page_bytes))
+            copy_pages.append(pages)
+            page_ranges.append((start, start + pages.numel()))
+
+    cache_tensors = copy_pages + [
+        tensor for tensor in cache_tensors if not any(start <= tensor.data_ptr() < end for start, end in page_ranges)
+    ]
+    for tensor in cache_tensors:
         # FP8 is storage here. NPU stack/index operators need byte views;
         # same-size bitcasts preserve the non-contiguous page geometry.
         if tensor.dtype == torch.float8_e4m3fn:

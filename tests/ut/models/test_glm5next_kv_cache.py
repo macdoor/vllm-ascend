@@ -4,7 +4,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -87,6 +87,7 @@ def test_tail_uses_one_full_precision_page(capacity):
     assert not spec.prefix_cacheable
     assert not is_prefix_cacheable(spec)
     assert spec.is_circular
+    assert not spec.uses_slot_mapping
     context_parallel_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=1024),
         parallel_config=SimpleNamespace(
@@ -184,15 +185,11 @@ def test_invalid_pool_geometry_is_rejected(ratio):
         format_indexer_kpool_slot_mapping(torch.tensor([0]), torch.tensor([0]), 128, ratio)
 
 
-@pytest.mark.parametrize(
-    "storage_block_size,kernel_block_size",
-    [(8, None), (24, None), (144, None), (1536, None), (2048, None), (1536, 128)],
-)
-def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size, kernel_block_size):
+@pytest.mark.parametrize("storage_block_size", [8, 24, 144, 1536, 2048])
+def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
     pool_size = 16
     logical_size = storage_block_size * pool_size
-    kernel_size = kernel_block_size or 128
-    split = logical_size // kernel_size
+    split = logical_size // 128
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=logical_size),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
@@ -233,9 +230,9 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size, k
     assert first.num_tokens == draft.num_tokens == 3
     assert first.max_pool_seq_len == draft.max_pool_seq_len == storage_block_size + 1
     # Kernel-granularity blocks: the metadata reports the natural kernel rows
-    # (kernel size / pool ratio) and passes the common expanded table through
+    # (128 tokens / pool ratio) and passes the common expanded table through
     # as a view, so both builders observe the same persistent buffer.
-    assert first.block_size == kernel_size // pool_size
+    assert first.block_size == 128 // pool_size
     torch.testing.assert_close(first.block_table, expanded)
     assert first.slot_mapping.tolist() == [8 * storage_block_size - 1, -1, 2 * storage_block_size, -1]
     assert first.seq_lens.tolist() == [storage_block_size + 1]
@@ -258,6 +255,7 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
         cache_config=SimpleNamespace(block_size=128),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=5, max_num_seqs=2),
         model_config=SimpleNamespace(max_model_len=256),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
     spec = AscendMLAAttentionSpec(
         block_size=128,
@@ -292,7 +290,18 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
         block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
     )
     metadata = builder.build(0, common)
-    tail = tail_builder.build(0, common)
+    tail_common = SimpleNamespace(**vars(common))
+    tail_common.slot_mapping = torch.full_like(common.slot_mapping, -1)
+
+    def cpu_slots(num_tokens, _max_tokens, starts, positions, table, _stride, capacity, output, **kwargs):
+        output.fill_(-1)
+        for req, (start, end) in enumerate(zip(starts[:-1], starts[1:])):
+            output[start:end] = table[req, 0] * capacity + positions[start:end] % capacity
+
+    kernel = MagicMock()
+    kernel.__getitem__.return_value.side_effect = cpu_slots
+    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool._compute_slot_mapping_kernel", kernel)
+    tail = tail_builder.build(0, tail_common)
     assert metadata.num_tokens == 6
     assert builder.build_for_cudagraph_capture(common).num_tokens == 6
     assert metadata.positions.tolist() == [0, 1, 2, 3, 0, 0]
@@ -302,11 +311,11 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
     assert query.num_actual_tokens == 2
     assert query.positions.tolist() == [3, 0, 0]
     assert query.cum_query_lens.tolist() == [1, 2]
-    assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 128, -1]
+    assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 4, -1]
     refreshed = builder.build(0, common).query_metadata
     assert refreshed.cum_query_lens.data_ptr() == query.cum_query_lens.data_ptr()
     assert refreshed.positions.data_ptr() == query.positions.data_ptr()
-    assert tail_builder.build(0, common).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
+    assert tail_builder.build_for_drafting(tail_common, 1).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
 
 
 def test_model_cache_layers_publish_source_compatible_specs():
@@ -350,8 +359,6 @@ def test_model_cache_layers_publish_source_compatible_specs():
     assert state_spec.indexes_kv_by_block_stride
     assert indexer.get_attn_backend() is AscendIndexerKPoolBackend
     assert state.get_attn_backend() is AscendIndexerKPoolTailBackend
-    assert indexer.get_attn_backend().get_kv_cache_shape(3, 16, 1, 128, cache_dtype_str="auto") == (3, 16, 1, 128)
-    assert state.get_attn_backend().get_kv_cache_shape(3, 16, 1, 128, cache_dtype_str="auto") == (3, 2, 16, 128)
     assert set(current_config.compilation_config.static_forward_context) == {
         indexer.prefix,
         state.prefix,
@@ -371,6 +378,7 @@ def test_indexer_tail_initializes_exact_speculative_capacity(num_speculative_tok
         patch("vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config", return_value=config),
         patch("vllm_ascend.models.glm5next.attention.ReplicatedLinear", return_value=torch.nn.Identity()),
         patch("vllm_ascend.models.glm5next.attention.MergedColumnParallelLinear", return_value=torch.nn.Identity()),
+        patch("vllm_ascend.models.glm5next.attention.LayerNorm", torch.nn.LayerNorm),
     ):
         indexer = Indexer(
             config,

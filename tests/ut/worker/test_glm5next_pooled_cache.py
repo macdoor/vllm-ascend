@@ -25,13 +25,11 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     requires_padded_page_layout,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import collect_configured_register_regions
 from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_kv_cache_config,
     get_glm5_next_kv_cache_groups,
     get_glm5_next_pool_bytes_per_block,
 )
-from vllm_ascend.models.glm5next.cache_views import build_kv_cache_copy_views
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2 import attn_utils
@@ -330,6 +328,7 @@ def copy_cache(monkeypatch):
         runner.is_last_pp_rank = False
         runner.max_num_reqs = config.scheduler_config.max_num_seqs
         runner.model_config.enable_return_routed_experts = False
+        runner.model_config.architecture = "Glm5NextForCausalLM"
         runner.model_state = SimpleNamespace()
         runner.model = torch.nn.Module()
         runner.pcp_manager = runner.speculator = None
@@ -435,7 +434,10 @@ def test_copy_inventory_preserves_aliased_component_layouts(
             )
     if layout == "shared_page":
         components = (pages, other)
-        bindings = {"first": (pages[:, :4],), "second": (pages[:, :8],)}
+        bindings = {
+            "first": (pages[:, :4], pages[:, 4:8]),
+            "second": (pages[:, :4], pages[:, 4:12]),
+        }
         page_bytes = 16
     else:
         components = (key_raw.view(num_blocks, key_block_bytes), value_raw.view(torch.float32).view(num_blocks, 1))

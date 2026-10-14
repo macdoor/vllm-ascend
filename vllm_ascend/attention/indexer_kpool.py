@@ -30,6 +30,7 @@ from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_curr
 from vllm_ascend.models.glm5next.kv_cache import (
     format_indexer_kpool_slot_mapping,
 )
+from vllm_ascend.ops.triton.compute_slot_mapping import _compute_slot_mapping_kernel
 from vllm_ascend.utils import _round_up, enable_dsa_cp
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
@@ -354,6 +355,8 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
             )
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
+        if vllm_config.parallel_config.decode_context_parallel_size != 1:
+            raise ValueError("Circular tail caches do not support context parallelism.")
         self.use_dsa_cp = enable_dsa_cp()
         self.dsa_cp_size = get_tp_group().world_size if self.use_dsa_cp else 1
         self._max_num_batched_tokens = _round_up(vllm_config.scheduler_config.max_num_batched_tokens, self.dsa_cp_size)
@@ -369,21 +372,34 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
         del common_prefix_len, fast_build, kwargs
         num_reqs = common_attn_metadata.num_reqs
         num_input_tokens = common_attn_metadata.num_input_tokens
-        slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        if self.use_dsa_cp:
-            # Match the gathered K/gate rows, including TP alignment padding.
-            key = common_attn_metadata.slot_mapping.data_ptr()
-            if key not in self._slot_buffers:
-                self._slot_buffers[key] = torch.empty(
-                    self._max_num_batched_tokens, dtype=slot_mapping.dtype, device=self.device
-                )
-            padded_tokens = _round_up(num_input_tokens, self.dsa_cp_size)
-            slots = self._slot_buffers[key][:padded_tokens]
-            slots[:num_input_tokens].copy_(slot_mapping)
-            slots[num_input_tokens:].fill_(-1)
-            slot_mapping = slots
+        key = common_attn_metadata.slot_mapping.data_ptr()
+        if key not in self._slot_buffers:
+            self._slot_buffers[key] = torch.empty(self._max_num_batched_tokens, dtype=torch.int32, device=self.device)
+        slots = self._slot_buffers[key]
+        block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        _compute_slot_mapping_kernel[(num_reqs + 1,)](
+            num_input_tokens,
+            slots.numel(),
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.positions,
+            block_table,
+            block_table.stride(0),
+            self.block_size,
+            slots,
+            KV_CACHE_BLOCK_SIZE=self.block_size,
+            BLOCKS_PER_KV_BLOCK=1,
+            TOTAL_CP_WORLD_SIZE=1,
+            TOTAL_CP_RANK=0,
+            CP_KV_CACHE_INTERLEAVE_SIZE=1,
+            PAD_ID=-1,
+            TILE_BLOCK_SIZE=1024,
+            BLOCK_TABLE_WINDOW_SIZE=1,
+            IS_CIRCULAR=True,
+        )
+        slots[common_attn_metadata.num_actual_tokens : num_input_tokens].fill_(-1)
+        slot_mapping = slots[: _round_up(num_input_tokens, self.dsa_cp_size)]
         return AscendIndexerKPoolTailMetadata(
-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
+            block_table=block_table,
             slot_mapping=slot_mapping,
             block_size=self.block_size,
         )
