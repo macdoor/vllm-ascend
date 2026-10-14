@@ -61,15 +61,19 @@ def copy_kv_cache_blocks_inplace(
 
     copy_pages: list[torch.Tensor] = []
     page_ranges: list[tuple[int, int]] = []
-    for tensor in cache_tensors:
+    for tensor in sorted(cache_tensors, key=torch.Tensor.data_ptr) if aliased_origins else ():
         start = tensor.data_ptr()
-        if start not in aliased_origins or any(begin <= start < end for begin, end in page_ranges):
+        if any(begin <= start < end for begin, end in page_ranges):
             continue
         blocks = tensor.unflatten(0, (num_blocks, tensor.shape[0] // num_blocks))
         page_bytes = blocks.stride(0) * tensor.element_size()
         storage = tensor.untyped_storage()
         base = tensor.storage_offset() * tensor.element_size()
-        if page_bytes <= 0 or base + num_blocks * page_bytes > storage.nbytes():
+        if (
+            page_bytes <= 0
+            or base + num_blocks * page_bytes > storage.nbytes()
+            or not any(start <= origin < start + page_bytes for origin in aliased_origins)
+        ):
             continue
         # Aliasing alone does not prove a page layout. All overlapping views
         # must advance by the same physical page and fit inside its first row.

@@ -434,7 +434,10 @@ def test_copy_inventory_preserves_aliased_component_layouts(
             )
     if layout == "shared_page":
         components = (pages, other)
-        bindings = {"first": (pages[:, :4],), "second": (pages[:, :8],)}
+        bindings = {
+            "first": (pages[:, :4], pages[:, 4:8]),
+            "second": (pages[:, :4], pages[:, 4:12]),
+        }
         page_bytes = 16
     else:
         components = (key_raw.view(num_blocks, key_block_bytes), value_raw.view(torch.float32).view(num_blocks, 1))
