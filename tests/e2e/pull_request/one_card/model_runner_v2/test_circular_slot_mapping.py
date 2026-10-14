@@ -10,21 +10,38 @@ import torch_npu  # noqa: F401
 import vllm_ascend.patch.worker  # noqa: F401
 from vllm_ascend.attention.indexer_kpool import (
     AscendIndexerKPoolMetadataBuilder,
-    AscendIndexerKPoolTailMetadata,
+    AscendIndexerKPoolTailMetadataBuilder,
 )
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
 from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 
 
+@pytest.fixture
+def tail_builder_factory(monkeypatch):
+    torch.npu.set_device(0)
+    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: False)
+
+    def build(capacity, dim, max_tokens):
+        spec = AscendIndexerKPoolTailSpec(
+            block_size=capacity, sliding_window=4, compress_ratio=4, num_kv_heads=1, head_size=dim, dtype=torch.float32
+        )
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
+        )
+        return spec, AscendIndexerKPoolTailMetadataBuilder(spec, ["layer.tail"], config, torch.device("npu"))
+
+    return build
+
+
 @pytest.mark.parametrize("capacity", [5, 7, 11])
 @torch.inference_mode()
-def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> None:
-    """Exercise the enabled circular kernel through the MRV2 launch entry."""
-    torch.npu.set_device(0)
+def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int, tail_builder_factory) -> None:
     device = torch.device("npu")
     lengths = [1025, 0, 17]
     count = sum(lengths)
+    tail_spec, builder = tail_builder_factory(capacity, 128, count + 19)
     tables = AscendBlockTables(
         block_sizes=[32, capacity, 8],
         kernel_block_sizes=[16, capacity, 8],
@@ -32,9 +49,8 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
         max_num_batched_tokens=count + 19,
         max_num_blocks_per_group=[256, 1, 1],
         device=device,
-        slot_mapping_enabled=[True, True, False],
+        slot_mapping_enabled=[True, tail_spec.uses_slot_mapping, False],
     )
-    tables.configure_circular([False, True, True])
     ordinary = torch.arange(100, 100 + 3 * 512, dtype=torch.int32).view(3, 512)
     ring = torch.tensor([[9], [7], [5]], dtype=torch.int32)
     tables.block_tables[0].gpu.copy_(ordinary.to(device))
@@ -44,11 +60,20 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
     starts = torch.tensor([0, lengths[0], lengths[0], count], dtype=torch.int32, device=device)
     positions = torch.zeros(count, dtype=torch.int64, device=device)
     output = torch.full_like(tables.slot_mappings, 777)
+    common = SimpleNamespace(
+        num_reqs=3,
+        num_input_tokens=count,
+        num_actual_tokens=count,
+        query_start_loc=starts,
+        positions=positions,
+        slot_mapping=output[1],
+        block_table_tensor=ring[[2, 1, 0]].to(device),
+    )
 
     def run():
-        return tables.compute_slot_mappings(mapping, starts, positions, count + 7, out=output)
+        tables.compute_slot_mappings(mapping, starts, positions, count + 7, out=output)
+        output[1, :count].copy_(builder.build(0, common).slot_mapping)
 
-    # Compile before capture; replay grows beyond the dummy and a 1024-token tile.
     run()
     torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
@@ -72,7 +97,6 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
                 run()
             torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
 
-    # Disable ordinary addressing for the negative circular/PAD sentinel.
     tables.slot_mapping_enabled[0] = False
     positions[0] = -1
     expected[0].fill_(-1)
@@ -82,12 +106,9 @@ def test_circular_slot_mapping_wraparound_and_graph_replay(capacity: int) -> Non
 
 
 @torch.inference_mode()
-def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> None:
-    """Replay growing verification batches and replace rejected draft tokens."""
-    torch.npu.set_device(0)
+def test_kpool_capture_replay_preserves_rejected_pool_history(tail_builder_factory) -> None:
     device = torch.device("npu")
     pool, capacity, dim, topk = 4, 7, 128, 2048
-    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: False)
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
@@ -106,8 +127,10 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
         config,
         device,
     )
-    tables = AscendBlockTables([128, capacity], 1, 4, [1, 1], device)
-    tables.configure_circular([False, True])
+    tail_spec, tail_builder = tail_builder_factory(capacity, dim, 4)
+    tables = AscendBlockTables(
+        [128, capacity], 1, 4, [1, 1], device, slot_mapping_enabled=[True, tail_spec.uses_slot_mapping]
+    )
     tables.block_tables[0].gpu.fill_(3)
     tables.block_tables[1].gpu.fill_(2)
     mapping = torch.zeros(1, dtype=torch.int32, device=device)
@@ -127,7 +150,10 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
         block_table_tensor=tables.block_tables[0].gpu,
     )
     metadata = builder.build_for_cudagraph_capture(common)
-    tail_metadata = AscendIndexerKPoolTailMetadata(tables.block_tables[1].gpu, slots[1], capacity)
+    tail_common = SimpleNamespace(**vars(common))
+    tail_common.slot_mapping = slots[1]
+    tail_common.block_table_tensor = tables.block_tables[1].gpu
+    tail_metadata = tail_builder.build(0, tail_common)
     tail = torch.zeros(4, 2, capacity, dim, device=device)
     cache = torch.zeros(4, 32, 1, dim, dtype=torch.bfloat16, device=device)
     keys = torch.zeros(4, dim, device=device)
@@ -182,7 +208,9 @@ def test_kpool_capture_replay_preserves_rejected_pool_history(monkeypatch) -> No
         common.seq_lens.fill_(begin + count)
         common._seq_lens_cpu.fill_(begin + count)
         common.num_actual_tokens = count
+        tail_common.num_actual_tokens = count
         tables.compute_slot_mappings(mapping, starts, positions, 4)
+        tail_builder.build(0, tail_common)
         if count == 1:
             builder.build_for_drafting(common, draft_index=(begin - 7) % pool)
         else:

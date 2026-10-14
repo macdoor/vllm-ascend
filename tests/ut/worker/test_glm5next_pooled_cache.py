@@ -328,6 +328,7 @@ def copy_cache(monkeypatch):
         runner.is_last_pp_rank = False
         runner.max_num_reqs = config.scheduler_config.max_num_seqs
         runner.model_config.enable_return_routed_experts = False
+        runner.model_config.architecture = "Glm5NextForCausalLM"
         runner.model_state = SimpleNamespace()
         runner.model = torch.nn.Module()
         runner.pcp_manager = runner.speculator = None

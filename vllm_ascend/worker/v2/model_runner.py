@@ -21,7 +21,7 @@ import inspect
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -123,9 +123,6 @@ from vllm_ascend.worker.v2.utils import (
     prepare_v41_source_rope,
     torch_cuda_wrapper,
 )
-
-if TYPE_CHECKING:
-    from vllm_ascend.worker.v2.block_table import AscendBlockTables
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -468,9 +465,6 @@ class NPUModelRunner(GPUModelRunner):
             self.vllm_config.scheduler_config.max_num_seqs,
         )
 
-        cast("AscendBlockTables", self.block_tables).configure_circular(
-            [is_circular_kv_cache_spec(group.kv_cache_spec) for group in self.kv_cache_config.kv_cache_groups]
-        )
         self.kv_caches = build_kv_cache_copy_views(
             self.kv_cache_config,
             lambda name: self.compilation_config.static_forward_context[name].kv_cache,

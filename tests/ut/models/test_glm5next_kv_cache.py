@@ -4,7 +4,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -87,6 +87,7 @@ def test_tail_uses_one_full_precision_page(capacity):
     assert not spec.prefix_cacheable
     assert not is_prefix_cacheable(spec)
     assert spec.is_circular
+    assert not spec.uses_slot_mapping
     context_parallel_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=1024),
         parallel_config=SimpleNamespace(
@@ -254,6 +255,7 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
         cache_config=SimpleNamespace(block_size=128),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=5, max_num_seqs=2),
         model_config=SimpleNamespace(max_model_len=256),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
     spec = AscendMLAAttentionSpec(
         block_size=128,
@@ -288,7 +290,18 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
         block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
     )
     metadata = builder.build(0, common)
-    tail = tail_builder.build(0, common)
+    tail_common = SimpleNamespace(**vars(common))
+    tail_common.slot_mapping = torch.full_like(common.slot_mapping, -1)
+
+    def cpu_slots(num_tokens, _max_tokens, starts, positions, table, _stride, capacity, output, **kwargs):
+        output.fill_(-1)
+        for req, (start, end) in enumerate(zip(starts[:-1], starts[1:])):
+            output[start:end] = table[req, 0] * capacity + positions[start:end] % capacity
+
+    kernel = MagicMock()
+    kernel.__getitem__.return_value.side_effect = cpu_slots
+    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool._compute_slot_mapping_kernel", kernel)
+    tail = tail_builder.build(0, tail_common)
     assert metadata.num_tokens == 6
     assert builder.build_for_cudagraph_capture(common).num_tokens == 6
     assert metadata.positions.tolist() == [0, 1, 2, 3, 0, 0]
@@ -298,11 +311,11 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
     assert query.num_actual_tokens == 2
     assert query.positions.tolist() == [3, 0, 0]
     assert query.cum_query_lens.tolist() == [1, 2]
-    assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 128, -1]
+    assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 4, -1]
     refreshed = builder.build(0, common).query_metadata
     assert refreshed.cum_query_lens.data_ptr() == query.cum_query_lens.data_ptr()
     assert refreshed.positions.data_ptr() == query.positions.data_ptr()
-    assert tail_builder.build(0, common).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
+    assert tail_builder.build_for_drafting(tail_common, 1).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
 
 
 def test_model_cache_layers_publish_source_compatible_specs():

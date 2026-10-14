@@ -428,6 +428,10 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
         return True
 
     @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+    @property
     def prefix_cacheable(self) -> bool:
         return False
 
