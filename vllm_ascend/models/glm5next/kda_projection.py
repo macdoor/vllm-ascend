@@ -13,6 +13,30 @@ KDA_BATCHED_GATE_MAX_TOKENS = 128
 KDA_BATCHED_GATE_MAX_WIDTH = 4096
 
 
+class KDAFGProjectionSide:
+    """Single-side callable view over a KDAFGProjection.
+
+    KDAInputProjectionTP reaches each up-projection through the upstream
+    `layer.f_b_proj(x)[0]` / `layer.g_b_proj(x)[0]` call convention. This
+    adapter mirrors it without materializing separate weight copies: the
+    canonical weights stay inside KDAFGProjection.
+    """
+
+    __slots__ = ("_owner", "_side")
+
+    def __init__(self, owner: "KDAFGProjection", side: int) -> None:
+        self._owner = owner
+        self._side = side
+
+    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor]:
+        merged = self._owner._merged
+        if merged is not None:
+            weight = merged.weight.view(2, -1, self._owner.head_dim)[self._side]
+            return (torch.nn.functional.linear(x, weight),)
+        projection = self._owner._f if self._side == 0 else self._owner._g
+        return (projection(x)[0],)
+
+
 class KDAFGProjection(nn.Module):
     """Own the canonical weights and dispatch without a derived weight cache.
 
